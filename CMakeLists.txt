@@ -9,3 +9,5 @@ add_subdirectory(tests)
 add_subdirectory(modules/quantization)
 
 add_subdirectory(modules/svd_lowrank_cuda)
+
+add_subdirectory(modules/topk)

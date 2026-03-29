@@ -22,6 +22,18 @@ function(add_quantization_test target_name source_file)
     )
 endfunction()
 
+function(add_topk_test target_name source_file)
+    add_executable(${target_name})
+    target_sources(${target_name}
+        PRIVATE
+            ${source_file}
+    )
+    target_link_libraries(${target_name}
+        PRIVATE
+            topk_lib
+    )
+endfunction()
+
 add_quantization_test(quantization_q8_0_tests quantization/test_q8_0_impl.cpp)
 add_quantization_test(quantization_q4_0_tests quantization/test_q4_0_impl.cpp)
 add_quantization_test(quantization_q2_k_tests quantization/test_q2_k_impl.cpp)
@@ -35,3 +47,6 @@ add_quantization_test(quantization_mxfp4_tests quantization/test_mxfp4_impl.cpp)
 add_quantization_test(quantization_nvfp4_tests quantization/test_nvfp4_impl.cpp)
 add_quantization_test(quantization_nf4_tests quantization/test_nf4_impl.cpp)
 add_quantization_test(quantization_nf4_dq_tests quantization/test_nf4_dq_impl.cpp)
+
+add_topk_test(topk_extraction_tests topk/test_topk_extraction.cpp)
+add_topk_test(topk_separation_tests topk/test_topk_separation.cpp)
