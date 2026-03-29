@@ -1,4 +1,4 @@
-#include "svd_lowrank_cuda/svd_lowrank_cuda.h"
+#include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -199,7 +199,7 @@ void initialize_workspace_and_lwork(SVDLowrankCUDAContext* ctx) {
     check_cuda(cudaMalloc(&ctx->d.d_work, static_cast<std::size_t>(ctx->lwork) * sizeof(float)), "cudaMalloc d_work failed");
 }
 
-void run_warmup(SVDLowrankCUDAContext* ctx, std::uint64_t seed) {
+void run_warmup(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
     check_curand(curandSetPseudoRandomGeneratorSeed(ctx->curandGen, seed), "warmup curandSetPseudoRandomGeneratorSeed failed");
     check_cuda(cudaMemset(ctx->d.d_A_row_major, 0, static_cast<std::size_t>(ctx->m) * ctx->n * sizeof(float)),
                "warmup cudaMemset d_A_row_major failed");
@@ -276,7 +276,7 @@ void run_warmup(SVDLowrankCUDAContext* ctx, std::uint64_t seed) {
 
 } // namespace
 
-void svd_lowrank_cuda_initialize(int m, int n, int q, std::uint64_t warmup_seed) {
+void svd_lowrank_cuda_initialize(int m, int n, int q, unsigned long long warmup_seed) {
     if (m <= 0 || n <= 0) {
         throw std::invalid_argument("m and n must be positive");
     }
@@ -348,7 +348,7 @@ void svd_lowrank_cuda_release() {
     g_ctx.destroy_all();
 }
 
-const SVDLowrankCPUResult& svd_lowrank_cuda(const float* A_row_major, int niter, std::uint64_t seed, SVDLowrankTimings* timings) {
+const SVDLowrankCPUResult& svd_lowrank_cuda(const float* A_row_major, int niter, unsigned long long seed, SVDLowrankTimings* timings) {
     if (!g_ctx.initialized) {
         throw std::logic_error("svd_lowrank_cuda is not initialized; call svd_lowrank_cuda_initialize(m, n, q) first");
     }

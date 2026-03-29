@@ -23,13 +23,13 @@ struct SVDLowrankCPUResult {
 const SVDLowrankCPUResult& svd_lowrank_cuda(
     const float* A_row_major,
     int niter = 2,
-    std::uint64_t seed = 1234ULL,
+    unsigned long long seed = 1234ULL,
     SVDLowrankTimings* timings = nullptr);
 
 void svd_lowrank_cuda_initialize(
     int m,
     int n,
     int q,
-    std::uint64_t warmup_seed = 1234ULL);
+    unsigned long long warmup_seed = 1234ULL);
 
 void svd_lowrank_cuda_release();

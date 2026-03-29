@@ -1,4 +1,4 @@
-#include "svd_lowrank_cuda/svd_lowrank_cuda.h"
+#include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -35,7 +35,7 @@ std::vector<float> transpose_row_major(const std::vector<float>& A, int rows, in
     return At;
 }
 
-std::vector<float> make_low_rank_matrix(int m, int n, int rank, std::uint64_t seed) {
+std::vector<float> make_low_rank_matrix(int m, int n, int rank, unsigned long long seed) {
     std::mt19937 gen(static_cast<std::mt19937::result_type>(seed));
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
@@ -85,7 +85,7 @@ int main() {
 
         constexpr int q = 64;
         constexpr int niter = 2;
-        constexpr std::uint64_t base_seed = 20260323ULL;
+        constexpr unsigned long long base_seed = 20260323ULL;
 
         std::cout << "svd_lowrank_cuda benchmark" << '\n';
         std::cout << "q=" << q << ", niter=" << niter << '\n';
@@ -94,7 +94,7 @@ int main() {
         for (int m : ms) {
             for (int n : ns) {
                 const int true_rank = std::min({q / 2, m, n});
-                const std::uint64_t seed = base_seed + static_cast<std::uint64_t>(m) * 100000ULL + static_cast<std::uint64_t>(n);
+                const unsigned long long seed = base_seed + static_cast<unsigned long long>(m) * 100000ULL + static_cast<unsigned long long>(n);
 
                 std::cout << "\nCase m=" << m << ", n=" << n << ", true_rank=" << true_rank << '\n';
 

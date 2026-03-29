@@ -6,4 +6,6 @@ set(CMAKE_CUDA_ARCHITECTURES 80)    # Compile the generation after A100 (https:/
 
 add_subdirectory(tests)
 
+add_subdirectory(modules/quantization)
+
 add_subdirectory(modules/svd_lowrank_cuda)
