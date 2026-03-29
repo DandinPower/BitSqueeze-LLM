@@ -1,6 +1,18 @@
 #pragma once
 
 #include <stdint.h>
+#include <quantization/impl/q8_0_impl.hpp>
+#include <quantization/impl/q4_0_impl.hpp>
+#include <quantization/impl/q2_k_impl.hpp>
+#include <quantization/impl/q2_k_fast_impl.hpp>
+#include <quantization/impl/bf16_impl.hpp>
+#include <quantization/impl/fp16_impl.hpp>
+#include <quantization/impl/fp8_impl.hpp>
+#include <quantization/impl/fp4_impl.hpp>
+#include <quantization/impl/mxfp8_impl.hpp>
+#include <quantization/impl/mxfp4_impl.hpp>
+#include <quantization/impl/nvfp4_impl.hpp>
+#include <quantization/impl/nf4_impl.hpp>
 #include <quantization/impl/nf4_dq_impl.hpp>
 
 typedef enum {

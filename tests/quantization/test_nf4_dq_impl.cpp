@@ -1,16 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <math.h>
-
 #include <quantization/quantization.hpp>
 #include <quantization/utils/random.hpp>
 #include <quantization/utils/evaluation.hpp>
-#include <inttypes.h>
 
 int main(void) {
-    const unsigned long long X   = 5;            /* number of random arrays            */
-    const unsigned long long N   = 4194304;      /* length of each array               */
+    const unsigned long long X   = 5;
+    const unsigned long long N   = 4194304;
     const float  MINV  = -10.0f;
     const float  MAXV  =  10.0f;
     const unsigned int SEED = 12345;
@@ -59,11 +55,9 @@ int main(void) {
         double size_kb = quantization_get_packed_size(buf) / 1024.0;
         double bw = 8.0 * size_kb * 1024.0 / (double)N;
 
-        printf("[array %llu] N=%llu, original_size=%.3f KB\n",
-               (unsigned long long)k, (unsigned long long)N, N * sizeof(float) / 1024.0);
-        printf("   NF4_DQ: size=%.3f KB, B/W=%.5f, MAE=%.6f, MSE=%.6f, MaxAbs=%.6f\n",
-               size_kb, bw, mae, mse, maxabs);
-        printf("          CompTime=%.3f ms, DecompTime=%.3f ms\n", comp_time, decomp_time);
+        printf("[array %llu] NF4_DQ: size=%.3f KB, B/W=%.5f, MAE=%.6f, MSE=%.6f, MaxAbs=%.6f\n",
+               (unsigned long long)k, size_kb, bw, mae, mse, maxabs);
+        printf("           CompTime=%.3f ms, DecompTime=%.3f ms\n", comp_time, decomp_time);
 
         free(deq);
         quantization_free(buf);
