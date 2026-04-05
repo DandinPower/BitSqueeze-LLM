@@ -72,19 +72,19 @@ int bitsqz_llm_initialize(
 void bitsqz_llm_release();
 
 int bitsqz_llm_compress(
-    const float *row_major_matrix_float_data,
+    const float *d_row_major_matrix_float_data,
     bitsqz_llm_array_t **out,
     bitsqz_llm_compress_profile_t *profile);
 
 inline int bitsqz_llm_compress(
-    const float *row_major_matrix_float_data,
+    const float *d_row_major_matrix_float_data,
     bitsqz_llm_array_t **out) {
-    return bitsqz_llm_compress(row_major_matrix_float_data, out, nullptr);
+    return bitsqz_llm_compress(d_row_major_matrix_float_data, out, nullptr);
 }
 
 int bitsqz_llm_decompress(
     const bitsqz_llm_array_t *compressed,
-    float *dst,
+    float *d_dst,
     uint32_t dst_num_elements);
 
 uint64_t bitsqz_llm_get_packed_size(const bitsqz_llm_array_t *compressed);

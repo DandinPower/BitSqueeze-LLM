@@ -22,7 +22,7 @@ find_package(OpenMP)
 
 target_sources(bitsqz_llm_lib
     PRIVATE 
-        src/bitsqz_llm.cpp
+        src/bitsqz_llm.cu
 )
 target_include_directories(bitsqz_llm_lib
     PUBLIC 

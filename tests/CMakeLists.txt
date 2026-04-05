@@ -45,6 +45,7 @@ function(add_topk_test target_name source_file)
     target_link_libraries(${target_name}
         PRIVATE
             topk_lib
+            CUDA::cudart
     )
 endfunction()
 
@@ -57,6 +58,7 @@ function(add_bitsqz_llm_test target_name source_file)
     target_link_libraries(${target_name}
         PRIVATE
             bitsqz_llm_lib
+            CUDA::cudart
     )
 endfunction()
 
@@ -76,6 +78,7 @@ add_quantization_test(quantization_nf4_dq_tests quantization/test_nf4_dq_impl.cp
 
 add_topk_test(topk_extraction_tests topk/test_topk_extraction.cpp)
 add_topk_test(topk_separation_tests topk/test_topk_separation.cpp)
+add_topk_test(topk_pack_roundtrip_tests topk/test_topk_pack_roundtrip.cpp)
 
 add_bitsqz_llm_test(bitsqz_llm_quantization_tests bitsqz_llm/test_quantization.cpp)
 add_bitsqz_llm_test(bitsqz_llm_svd_tests bitsqz_llm/test_svd.cpp)

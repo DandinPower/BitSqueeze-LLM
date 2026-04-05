@@ -2,75 +2,139 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 #include <topk.hpp>
 
-static bool almost_equal(float a, float b, float eps = 1e-6f) {
+namespace {
+
+bool almost_equal(float a, float b, float eps = 1e-6f) {
     return std::fabs(a - b) <= eps;
 }
 
-static int run_case(float ratio, uint16_t rows, uint16_t cols, const std::vector<float> &source) {
-    std::vector<float> residual = source;
-    topk_array_t *topk_array = NULL;
-
-    if (topk_separation(residual.data(), rows, cols, ratio, &topk_array) != 0 || !topk_array) {
-        std::fprintf(stderr, "topk_separation failed\n");
-        return 1;
+void check_cuda(cudaError_t status, const char *msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
     }
+}
 
-    if (topk_array->num_rows != rows || topk_array->num_columns != cols) {
-        std::fprintf(stderr, "shape mismatch in topk_array\n");
-        free_topk_array(topk_array);
-        return 1;
+struct DeviceBuffers {
+    float *d_residual = nullptr;
+    uint16_t *d_topk_indices = nullptr;
+    float *d_topk_values = nullptr;
+
+    ~DeviceBuffers() {
+        cudaFree(d_residual);
+        cudaFree(d_topk_indices);
+        cudaFree(d_topk_values);
     }
+};
 
-    for (uint16_t r = 0; r < rows; ++r) {
-        std::set<uint16_t> selected;
-        uint32_t base = (uint32_t)r * topk_array->num_topk_columns;
+int run_case(float ratio, uint16_t rows, uint16_t cols, const std::vector<float> &source) {
+    TopkCUDAContext ctx;
+    DeviceBuffers buffers;
 
-        for (uint16_t j = 0; j < topk_array->num_topk_columns; ++j) {
-            uint16_t c = topk_array->topk_indices[base + j];
-            selected.insert(c);
-            float v = residual[(uint32_t)r * cols + c];
-            if (!almost_equal(v, 0.0f)) {
-                std::fprintf(stderr, "selected position not zeroed by separation\n");
-                free_topk_array(topk_array);
+    try {
+        const uint16_t k = topk_compute_num_topk_columns(cols, ratio);
+        const uint32_t topk_elements = topk_compute_num_topk_elements(rows, k);
+
+        topk_initialize(&ctx, rows, cols, 20260405ULL);
+        check_cuda(cudaMalloc(&buffers.d_residual, source.size() * sizeof(float)), "cudaMalloc d_residual failed");
+        if (topk_elements > 0) {
+            check_cuda(cudaMalloc(&buffers.d_topk_indices, topk_elements * sizeof(uint16_t)),
+                       "cudaMalloc d_topk_indices failed");
+            check_cuda(cudaMalloc(&buffers.d_topk_values, topk_elements * sizeof(float)),
+                       "cudaMalloc d_topk_values failed");
+        }
+        check_cuda(cudaMemcpy(
+                       buffers.d_residual,
+                       source.data(),
+                       source.size() * sizeof(float),
+                       cudaMemcpyHostToDevice),
+                   "cudaMemcpy residual H2D failed");
+
+        topk_array_t topk_array{};
+        topk_bind_array(&topk_array, rows, cols, k, buffers.d_topk_indices, buffers.d_topk_values);
+        topk_separation(&ctx, buffers.d_residual, &topk_array);
+
+        std::vector<float> residual(source.size(), 0.0f);
+        check_cuda(cudaMemcpy(
+                       residual.data(),
+                       buffers.d_residual,
+                       residual.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy residual D2H failed");
+
+        std::vector<uint16_t> topk_indices(topk_elements, 0);
+        if (topk_elements > 0) {
+            check_cuda(cudaMemcpy(
+                           topk_indices.data(),
+                           buffers.d_topk_indices,
+                           topk_indices.size() * sizeof(uint16_t),
+                           cudaMemcpyDeviceToHost),
+                       "cudaMemcpy topk indices D2H failed");
+        }
+
+        for (uint16_t r = 0; r < rows; ++r) {
+            std::set<uint16_t> selected;
+            const uint32_t base = static_cast<uint32_t>(r) * k;
+
+            for (uint16_t j = 0; j < k; ++j) {
+                const uint16_t c = topk_indices[base + j];
+                selected.insert(c);
+                if (!almost_equal(residual[static_cast<uint32_t>(r) * cols + c], 0.0f)) {
+                    std::fprintf(stderr, "selected position not zeroed by separation\n");
+                    topk_release(&ctx);
+                    return 1;
+                }
+            }
+
+            for (uint16_t c = 0; c < cols; ++c) {
+                if (!selected.count(c)) {
+                    const float expected = source[static_cast<uint32_t>(r) * cols + c];
+                    const float actual = residual[static_cast<uint32_t>(r) * cols + c];
+                    if (!almost_equal(expected, actual)) {
+                        std::fprintf(stderr, "non-selected position changed by separation\n");
+                        topk_release(&ctx);
+                        return 1;
+                    }
+                }
+            }
+        }
+
+        topk_apply(&ctx, &topk_array, buffers.d_residual);
+        std::vector<float> restored(source.size(), 0.0f);
+        check_cuda(cudaMemcpy(
+                       restored.data(),
+                       buffers.d_residual,
+                       restored.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy restored D2H failed");
+
+        for (size_t i = 0; i < source.size(); ++i) {
+            if (!almost_equal(restored[i], source[i])) {
+                std::fprintf(stderr, "reconstruction mismatch at %zu\n", i);
+                topk_release(&ctx);
                 return 1;
             }
         }
 
-        for (uint16_t c = 0; c < cols; ++c) {
-            if (!selected.count(c)) {
-                float expected = source[(uint32_t)r * cols + c];
-                float actual = residual[(uint32_t)r * cols + c];
-                if (!almost_equal(expected, actual)) {
-                    std::fprintf(stderr, "non-selected position changed by separation\n");
-                    free_topk_array(topk_array);
-                    return 1;
-                }
-            }
-        }
-    }
-
-    if (topk_apply(topk_array, residual.data()) != 0) {
-        std::fprintf(stderr, "topk_apply failed\n");
-        free_topk_array(topk_array);
+        topk_release(&ctx);
+        return 0;
+    } catch (const std::exception &e) {
+        topk_release(&ctx);
+        std::fprintf(stderr, "Fatal error: %s\n", e.what());
         return 1;
     }
-
-    for (size_t i = 0; i < source.size(); ++i) {
-        if (!almost_equal(residual[i], source[i])) {
-            std::fprintf(stderr, "reconstruction mismatch at %zu\n", i);
-            free_topk_array(topk_array);
-            return 1;
-        }
-    }
-
-    free_topk_array(topk_array);
-    return 0;
 }
+
+} // namespace
 
 int main(void) {
     const uint16_t rows = 2;

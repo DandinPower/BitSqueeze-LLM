@@ -1,13 +1,34 @@
 #include <bitsqz_llm.hpp>
 
 #include <chrono>
-#include <cstdint>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 namespace {
+
+void check_cuda(cudaError_t status, const char *msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
+
+struct DeviceBuffers {
+    float *d_source = nullptr;
+    float *d_restored = nullptr;
+
+    ~DeviceBuffers() {
+        cudaFree(d_source);
+        cudaFree(d_restored);
+    }
+};
 
 bool almost_equal(float a, float b, float eps = 1e-4f) {
     return std::fabs(a - b) <= eps;
@@ -39,6 +60,21 @@ int run_case(const char *name,
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
 
+    DeviceBuffers buffers;
+    try {
+        check_cuda(cudaMalloc(&buffers.d_source, source.size() * sizeof(float)), "cudaMalloc d_source failed");
+        check_cuda(cudaMalloc(&buffers.d_restored, source.size() * sizeof(float)), "cudaMalloc d_restored failed");
+        check_cuda(cudaMemcpy(
+                       buffers.d_source,
+                       source.data(),
+                       source.size() * sizeof(float),
+                       cudaMemcpyHostToDevice),
+                   "cudaMemcpy source H2D failed");
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "%s: device setup failed: %s\n", name, e.what());
+        return 1;
+    }
+
     const auto init_begin = Clock::now();
     if (bitsqz_llm_initialize(rows,
                               cols,
@@ -57,8 +93,7 @@ int run_case(const char *name,
     bitsqz_llm_array_t *compressed = nullptr;
     bitsqz_llm_compress_profile_t compress_profile{};
     const auto compress_begin = Clock::now();
-    if (bitsqz_llm_compress(source.data(), &compressed, &compress_profile) != 0 ||
-        !compressed) {
+    if (bitsqz_llm_compress(buffers.d_source, &compressed, &compress_profile) != 0 || !compressed) {
         std::fprintf(stderr, "%s: compress failed\n", name);
         bitsqz_llm_release();
         return 1;
@@ -68,7 +103,7 @@ int run_case(const char *name,
     bitsqz_llm_release();
     std::vector<float> restored(source.size(), 0.0f);
     const auto decompress_begin = Clock::now();
-    if (bitsqz_llm_decompress(compressed, restored.data(), static_cast<uint32_t>(restored.size())) == 0) {
+    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
         std::fprintf(stderr, "%s: decompress should fail without initialize\n", name);
         bitsqz_llm_free(compressed);
         return 1;
@@ -86,8 +121,21 @@ int run_case(const char *name,
         bitsqz_llm_free(compressed);
         return 1;
     }
-    if (bitsqz_llm_decompress(compressed, restored.data(), static_cast<uint32_t>(restored.size())) != 0) {
+    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) != 0) {
         std::fprintf(stderr, "%s: decompress failed\n", name);
+        bitsqz_llm_free(compressed);
+        bitsqz_llm_release();
+        return 1;
+    }
+    try {
+        check_cuda(cudaMemcpy(
+                       restored.data(),
+                       buffers.d_restored,
+                       restored.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy restored D2H failed");
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "%s: restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(compressed);
         bitsqz_llm_release();
         return 1;
@@ -142,8 +190,22 @@ int run_case(const char *name,
         bitsqz_llm_free(compressed);
         return 1;
     }
-    if (bitsqz_llm_decompress(loaded, restored_after_load.data(), static_cast<uint32_t>(restored_after_load.size())) != 0) {
+    if (bitsqz_llm_decompress(loaded, buffers.d_restored, static_cast<uint32_t>(restored_after_load.size())) != 0) {
         std::fprintf(stderr, "%s: decompress after load failed\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        bitsqz_llm_release();
+        return 1;
+    }
+    try {
+        check_cuda(cudaMemcpy(
+                       restored_after_load.data(),
+                       buffers.d_restored,
+                       restored_after_load.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy restored_after_load D2H failed");
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "%s: reload restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(loaded);
         bitsqz_llm_free(compressed);
         bitsqz_llm_release();

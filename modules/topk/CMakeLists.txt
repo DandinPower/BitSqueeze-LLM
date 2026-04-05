@@ -1,10 +1,10 @@
-add_library(topk_lib)
+find_package(CUDAToolkit REQUIRED)
 
-find_package(OpenMP)
+add_library(topk_lib)
 
 target_sources(topk_lib
     PRIVATE
-        src/topk.cpp
+        src/topk.cu
 )
 
 target_include_directories(topk_lib
@@ -12,6 +12,7 @@ target_include_directories(topk_lib
         ${CMAKE_CURRENT_SOURCE_DIR}/include/
 )
 
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(topk_lib PUBLIC OpenMP::OpenMP_CXX)
-endif()
+target_link_libraries(topk_lib
+    PUBLIC
+        CUDA::cudart
+)
