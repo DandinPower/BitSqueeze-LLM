@@ -31,6 +31,7 @@ target_link_libraries(bitsqz_llm_lib
         quantization_lib
         topk_lib
         svd_lowrank_cuda_lib
+        reconstruct_lowrank_cuda_lib
 )
 if(OpenMP_CXX_FOUND)
     target_link_libraries(bitsqz_llm_lib PUBLIC OpenMP::OpenMP_CXX)

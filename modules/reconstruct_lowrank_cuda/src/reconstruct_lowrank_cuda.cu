@@ -53,17 +53,17 @@ void warmup(ReconstructLowrankCUDAContext* ctx, unsigned long long warmup_seed) 
     std::vector<float> S(static_cast<std::size_t>(ctx->k), 1.0f);
     std::vector<float> V(static_cast<std::size_t>(ctx->n) * ctx->k, 1.0f);
 
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_U,
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_U,
                           U.data(),
                           static_cast<std::size_t>(ctx->m) * ctx->k * sizeof(float),
                           cudaMemcpyHostToDevice),
                "warmup cudaMemcpy U failed");
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_S,
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_S,
                           S.data(),
                           static_cast<std::size_t>(ctx->k) * sizeof(float),
                           cudaMemcpyHostToDevice),
                "warmup cudaMemcpy S failed");
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_V,
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_V,
                           V.data(),
                           static_cast<std::size_t>(ctx->n) * ctx->k * sizeof(float),
                           cudaMemcpyHostToDevice),
@@ -146,16 +146,16 @@ void reconstruct_lowrank_cuda(
         throw std::invalid_argument("V_row_major size mismatch");
     }
 
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_U, U_row_major.data(), m * k * sizeof(float), cudaMemcpyHostToDevice),
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_U, U_row_major.data(), m * k * sizeof(float), cudaMemcpyHostToDevice),
                "cudaMemcpy U failed");
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_S, S.data(), k * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy S failed");
-    check_cuda(cudaMemcpy(ctx->cuda_ptrs.d_V, V_row_major.data(), n * k * sizeof(float), cudaMemcpyHostToDevice),
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_S, S.data(), k * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy S failed");
+    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_V, V_row_major.data(), n * k * sizeof(float), cudaMemcpyHostToDevice),
                "cudaMemcpy V failed");
 
     run_reconstruct_lowrank_cuda(ctx);
 
     out_row_major->resize(m * n);
-    check_cuda(cudaMemcpy(out_row_major->data(), ctx->cuda_ptrs.d_result, m * n * sizeof(float), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(out_row_major->data(), ctx->cuda_ptrs.d_result, m * n * sizeof(float), cudaMemcpyDeviceToHost),
                "cudaMemcpy result failed");
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize failed");
 }

@@ -13,6 +13,6 @@ target_include_directories(reconstruct_lowrank_cuda_lib
 )
 
 target_link_libraries(reconstruct_lowrank_cuda_lib 
-    PRIVATE
+    PUBLIC
         CUDA::cublas
 )

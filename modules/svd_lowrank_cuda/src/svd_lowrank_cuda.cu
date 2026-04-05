@@ -1,7 +1,6 @@
 #include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,12 +33,6 @@ inline void check_curand(curandStatus_t status, const char* msg) {
 inline void check_cusolver(cusolverStatus_t status, const char* msg) {
     if (status != CUSOLVER_STATUS_SUCCESS) {
         throw std::runtime_error(std::string(msg) + ": cusolver error code " + std::to_string(status));
-    }
-}
-
-inline void check_devinfo(int info, const char* msg) {
-    if (info != 0) {
-        throw std::runtime_error(std::string(msg) + ": devInfo=" + std::to_string(info));
     }
 }
 
@@ -110,22 +103,44 @@ struct SVDLowrankCUDAContext {
     int M_work = 0;
     int N_work = 0;
     int lwork = 0;
+    int niter = 0;
     bool is_transposed = false;
     bool initialized = false;
+
+    cudaStream_t stream = nullptr;
+    cudaGraph_t lowrank_graph = nullptr;
+    cudaGraphExec_t lowrank_graph_exec = nullptr;
+    int graph_niter = -1;
 
     cublasHandle_t cublasH = nullptr;
     cusolverDnHandle_t cusolverH = nullptr;
     curandGenerator_t curandGen = nullptr;
     gesvdjInfo_t svdj_params = nullptr;
     DevicePtrs d;
-    int h_info = 0;
 
     std::vector<float> h_U_work_col_major;
     std::vector<float> h_V_hat_col_major;
     SVDLowrankCPUResult host_result;
 
+    void destroy_graph() noexcept {
+        if (lowrank_graph_exec) {
+            cudaGraphExecDestroy(lowrank_graph_exec);
+            lowrank_graph_exec = nullptr;
+        }
+        if (lowrank_graph) {
+            cudaGraphDestroy(lowrank_graph);
+            lowrank_graph = nullptr;
+        }
+        graph_niter = -1;
+    }
+
     void destroy_all() noexcept {
+        destroy_graph();
         d.free_all();
+        if (stream) {
+            cudaStreamDestroy(stream);
+            stream = nullptr;
+        }
         if (svdj_params) {
             cusolverDnDestroyGesvdjInfo(svdj_params);
             svdj_params = nullptr;
@@ -149,8 +164,8 @@ struct SVDLowrankCUDAContext {
         M_work = 0;
         N_work = 0;
         lwork = 0;
+        niter = 0;
         is_transposed = false;
-        h_info = 0;
         h_U_work_col_major.clear();
         h_V_hat_col_major.clear();
         host_result = SVDLowrankCPUResult{};
@@ -199,53 +214,112 @@ void initialize_workspace_and_lwork(SVDLowrankCUDAContext* ctx) {
     check_cuda(cudaMalloc(&ctx->d.d_work, static_cast<std::size_t>(ctx->lwork) * sizeof(float)), "cudaMalloc d_work failed");
 }
 
-void run_warmup(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
-    check_curand(curandSetPseudoRandomGeneratorSeed(ctx->curandGen, seed), "warmup curandSetPseudoRandomGeneratorSeed failed");
-    check_cuda(cudaMemset(ctx->d.d_A_row_major, 0, static_cast<std::size_t>(ctx->m) * ctx->n * sizeof(float)),
-               "warmup cudaMemset d_A_row_major failed");
+void load_and_transpose_input(SVDLowrankCUDAContext* ctx, const float* A_row_major) {
+    const std::size_t matrix_bytes = static_cast<std::size_t>(ctx->m) * ctx->n * sizeof(float);
+    if (A_row_major != nullptr) {
+        check_cuda(cudaMemcpyAsync(ctx->d.d_A_row_major, A_row_major, matrix_bytes, cudaMemcpyHostToDevice, ctx->stream),
+                   "cudaMemcpyAsync H2D A failed");
+    } else {
+        check_cuda(cudaMemsetAsync(ctx->d.d_A_row_major, 0, matrix_bytes, ctx->stream), "cudaMemsetAsync d_A_row_major failed");
+    }
 
     constexpr int TILE = 16;
     const dim3 block(TILE, TILE);
     const dim3 grid((ctx->n + TILE - 1) / TILE, (ctx->m + TILE - 1) / TILE);
-    transpose_row_to_col_kernel<<<grid, block>>>(ctx->d.d_A_row_major, ctx->d.d_A, ctx->m, ctx->n);
-    check_cuda(cudaGetLastError(), "warmup transpose kernel launch failed");
+    transpose_row_to_col_kernel<<<grid, block, 0, ctx->stream>>>(ctx->d.d_A_row_major, ctx->d.d_A, ctx->m, ctx->n);
+    check_cuda(cudaGetLastError(), "transpose kernel launch failed");
+}
 
+void set_rng_seed(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
+    check_curand(curandSetPseudoRandomGeneratorSeed(ctx->curandGen, seed), "curandSetPseudoRandomGeneratorSeed failed");
+}
+
+void run_lowrank_compute_body(SVDLowrankCUDAContext* ctx, int niter) {
+    const int iters = std::max(0, niter);
     const cublasOperation_t op_A = ctx->is_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t op_A_H = ctx->is_transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    ctx->h_info = 0;
 
     check_curand(curandGenerateNormal(ctx->curandGen, ctx->d.d_R, static_cast<std::size_t>(ctx->N_work) * ctx->k, 0.0f, 1.0f),
-                 "warmup curandGenerateNormal failed");
+                 "curandGenerateNormal failed");
+
     check_cublas(cublasSgemm(ctx->cublasH, op_A, CUBLAS_OP_N, ctx->M_work, ctx->k, ctx->N_work, &alpha, ctx->d.d_A, ctx->m,
                              ctx->d.d_R, ctx->N_work, &beta, ctx->d.d_X, ctx->M_work),
-                 "warmup cublasSgemm A*R failed");
-
+                 "Initial cublasSgemm A*R failed");
     check_cusolver(cusolverDnSgeqrf(ctx->cusolverH, ctx->M_work, ctx->k, ctx->d.d_X, ctx->M_work, ctx->d.d_tau_M, ctx->d.d_work,
                                     ctx->lwork, ctx->d.d_devInfo),
-                   "warmup cusolverDnSgeqrf failed");
-    check_cuda(cudaMemcpy(&ctx->h_info, ctx->d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-               "warmup memcpy devInfo geqrf failed");
-    check_devinfo(ctx->h_info, "warmup geqrf failed");
-
-    check_cuda(cudaMemcpy(ctx->d.d_Q, ctx->d.d_X, static_cast<std::size_t>(ctx->M_work) * ctx->k * sizeof(float),
-                          cudaMemcpyDeviceToDevice),
-               "warmup memcpy X->Q failed");
+                   "cusolverDnSgeqrf initial failed");
+    check_cuda(cudaMemcpyAsync(ctx->d.d_Q,
+                               ctx->d.d_X,
+                               static_cast<std::size_t>(ctx->M_work) * ctx->k * sizeof(float),
+                               cudaMemcpyDeviceToDevice,
+                               ctx->stream),
+               "cudaMemcpyAsync X->Q failed");
     check_cusolver(cusolverDnSorgqr(ctx->cusolverH, ctx->M_work, ctx->k, ctx->k, ctx->d.d_Q, ctx->M_work, ctx->d.d_tau_M,
                                     ctx->d.d_work, ctx->lwork, ctx->d.d_devInfo),
-                   "warmup cusolverDnSorgqr failed");
-    check_cuda(cudaMemcpy(&ctx->h_info, ctx->d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-               "warmup memcpy devInfo orgqr failed");
-    check_devinfo(ctx->h_info, "warmup orgqr failed");
+                   "cusolverDnSorgqr initial failed");
 
-    check_cublas(cublasSgemm(ctx->cublasH, op_A_H, CUBLAS_OP_N, ctx->N_work, ctx->k, ctx->M_work, &alpha, ctx->d.d_A, ctx->m,
-                             ctx->d.d_Q, ctx->M_work, &beta, ctx->d.d_X_temp, ctx->N_work),
-                 "warmup cublasSgemm A^T*Q failed");
+    for (int i = 0; i < iters; ++i) {
+        check_cublas(cublasSgemm(ctx->cublasH, op_A_H, CUBLAS_OP_N, ctx->N_work, ctx->k, ctx->M_work, &alpha, ctx->d.d_A, ctx->m,
+                                 ctx->d.d_Q, ctx->M_work, &beta, ctx->d.d_X_temp, ctx->N_work),
+                     "Power iteration forward gemm failed");
+        check_cusolver(cusolverDnSgeqrf(ctx->cusolverH,
+                                        ctx->N_work,
+                                        ctx->k,
+                                        ctx->d.d_X_temp,
+                                        ctx->N_work,
+                                        ctx->d.d_tau_N,
+                                        ctx->d.d_work,
+                                        ctx->lwork,
+                                        ctx->d.d_devInfo),
+                       "Power geqrf N failed");
+        check_cuda(cudaMemcpyAsync(ctx->d.d_Q_temp,
+                                   ctx->d.d_X_temp,
+                                   static_cast<std::size_t>(ctx->N_work) * ctx->k * sizeof(float),
+                                   cudaMemcpyDeviceToDevice,
+                                   ctx->stream),
+                   "cudaMemcpyAsync X_temp->Q_temp failed");
+        check_cusolver(cusolverDnSorgqr(ctx->cusolverH,
+                                        ctx->N_work,
+                                        ctx->k,
+                                        ctx->k,
+                                        ctx->d.d_Q_temp,
+                                        ctx->N_work,
+                                        ctx->d.d_tau_N,
+                                        ctx->d.d_work,
+                                        ctx->lwork,
+                                        ctx->d.d_devInfo),
+                       "Power orgqr N failed");
 
-    check_cublas(cublasSgemm(ctx->cublasH, CUBLAS_OP_T, op_A, ctx->k, ctx->N_work, ctx->M_work, &alpha, ctx->d.d_Q,
-                             ctx->M_work, ctx->d.d_A, ctx->m, &beta, ctx->d.d_B, ctx->k),
-                 "warmup projection gemm failed");
+        check_cublas(cublasSgemm(ctx->cublasH, op_A, CUBLAS_OP_N, ctx->M_work, ctx->k, ctx->N_work, &alpha, ctx->d.d_A, ctx->m,
+                                 ctx->d.d_Q_temp, ctx->N_work, &beta, ctx->d.d_X, ctx->M_work),
+                     "Power iteration backward gemm failed");
+        check_cusolver(cusolverDnSgeqrf(ctx->cusolverH, ctx->M_work, ctx->k, ctx->d.d_X, ctx->M_work, ctx->d.d_tau_M, ctx->d.d_work,
+                                        ctx->lwork, ctx->d.d_devInfo),
+                       "Power geqrf M failed");
+        check_cuda(cudaMemcpyAsync(ctx->d.d_Q,
+                                   ctx->d.d_X,
+                                   static_cast<std::size_t>(ctx->M_work) * ctx->k * sizeof(float),
+                                   cudaMemcpyDeviceToDevice,
+                                   ctx->stream),
+                   "cudaMemcpyAsync X->Q in power failed");
+        check_cusolver(cusolverDnSorgqr(ctx->cusolverH,
+                                        ctx->M_work,
+                                        ctx->k,
+                                        ctx->k,
+                                        ctx->d.d_Q,
+                                        ctx->M_work,
+                                        ctx->d.d_tau_M,
+                                        ctx->d.d_work,
+                                        ctx->lwork,
+                                        ctx->d.d_devInfo),
+                       "Power orgqr M failed");
+    }
+
+    check_cublas(cublasSgemm(ctx->cublasH, CUBLAS_OP_T, op_A, ctx->k, ctx->N_work, ctx->M_work, &alpha, ctx->d.d_Q, ctx->M_work,
+                             ctx->d.d_A, ctx->m, &beta, ctx->d.d_B, ctx->k),
+                 "Projection gemm Q^T A failed");
     check_cusolver(cusolverDnSgesvdj(
                        ctx->cusolverH,
                        CUSOLVER_EIG_MODE_VECTOR,
@@ -263,25 +337,129 @@ void run_warmup(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
                        ctx->lwork,
                        ctx->d.d_devInfo,
                        ctx->svdj_params),
-                   "warmup cusolverDnSgesvdj failed");
-    check_cuda(cudaMemcpy(&ctx->h_info, ctx->d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-               "warmup memcpy devInfo gesvdj failed");
-    check_devinfo(ctx->h_info, "warmup gesvdj failed");
+                   "cusolverDnSgesvdj failed");
+    check_cublas(cublasSgemm(ctx->cublasH, CUBLAS_OP_N, CUBLAS_OP_N, ctx->M_work, ctx->k, ctx->k, &alpha, ctx->d.d_Q, ctx->M_work,
+                             ctx->d.d_U_hat, ctx->k, &beta, ctx->d.d_U_work, ctx->M_work),
+                 "Recover U_work gemm failed");
+}
 
-    check_cublas(cublasSgemm(ctx->cublasH, CUBLAS_OP_N, CUBLAS_OP_N, ctx->M_work, ctx->k, ctx->k, &alpha, ctx->d.d_Q,
-                             ctx->M_work, ctx->d.d_U_hat, ctx->k, &beta, ctx->d.d_U_work, ctx->M_work),
-                 "warmup recover U_work gemm failed");
-    check_cuda(cudaDeviceSynchronize(), "warmup cudaDeviceSynchronize failed");
+void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
+    ctx->destroy_graph();
+
+    cudaGraph_t captured_graph = nullptr;
+    cudaError_t begin_status = cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
+    if (begin_status != cudaSuccess) {
+        (void) cudaGetLastError();
+        throw std::runtime_error(
+            std::string("cudaStreamBeginCapture for lowrank graph failed: ") + cudaGetErrorString(begin_status));
+    }
+
+    std::string body_error;
+    try {
+        run_lowrank_compute_body(ctx, niter);
+    } catch (const std::exception& e) {
+        body_error = e.what();
+    } catch (...) {
+        body_error = "unknown exception";
+    }
+
+    cudaError_t end_status = cudaStreamEndCapture(ctx->stream, &captured_graph);
+    if (!body_error.empty()) {
+        if (captured_graph) {
+            cudaGraphDestroy(captured_graph);
+        }
+        (void) cudaGetLastError();
+        throw std::runtime_error("lowrank graph capture body failed: " + body_error);
+    }
+    if (end_status != cudaSuccess || captured_graph == nullptr) {
+        if (captured_graph) {
+            cudaGraphDestroy(captured_graph);
+        }
+        (void) cudaGetLastError();
+        throw std::runtime_error(
+            std::string("cudaStreamEndCapture for lowrank graph failed: ") + cudaGetErrorString(end_status));
+    }
+
+    cudaGraphExec_t graph_exec = nullptr;
+    cudaError_t inst_status = cudaGraphInstantiate(&graph_exec, captured_graph, nullptr, nullptr, 0);
+    if (inst_status != cudaSuccess) {
+        cudaGraphDestroy(captured_graph);
+        (void) cudaGetLastError();
+        throw std::runtime_error(
+            std::string("cudaGraphInstantiate for lowrank graph failed: ") + cudaGetErrorString(inst_status));
+    }
+
+    ctx->lowrank_graph = captured_graph;
+    ctx->lowrank_graph_exec = graph_exec;
+    ctx->graph_niter = std::max(0, niter);
+}
+
+void run_lowrank_compute(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
+    set_rng_seed(ctx, seed);
+    if (!ctx->lowrank_graph_exec) {
+        throw std::logic_error("lowrank CUDA graph is not captured; initialization must capture successfully");
+    }
+    if (ctx->graph_niter != ctx->niter) {
+        throw std::logic_error("lowrank CUDA graph niter mismatch; recapture is required before execution");
+    }
+    check_cuda(cudaGraphLaunch(ctx->lowrank_graph_exec, ctx->stream), "cudaGraphLaunch lowrank graph failed");
+}
+
+void copy_result_to_host(SVDLowrankCUDAContext* ctx) {
+    check_cuda(cudaMemcpyAsync(ctx->h_U_work_col_major.data(),
+                               ctx->d.d_U_work,
+                               static_cast<std::size_t>(ctx->M_work) * ctx->k * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               ctx->stream),
+               "cudaMemcpyAsync U_work D2H failed");
+    check_cuda(cudaMemcpyAsync(ctx->h_V_hat_col_major.data(),
+                               ctx->d.d_V_hat,
+                               static_cast<std::size_t>(ctx->N_work) * ctx->k * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               ctx->stream),
+               "cudaMemcpyAsync V_hat D2H failed");
+    check_cuda(cudaMemcpyAsync(ctx->host_result.S.data(),
+                               ctx->d.d_S,
+                               static_cast<std::size_t>(ctx->k) * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               ctx->stream),
+               "cudaMemcpyAsync S D2H failed");
+    check_cuda(cudaStreamSynchronize(ctx->stream), "cudaStreamSynchronize after D2H failed");
+
+    if (ctx->is_transposed) {
+        col_major_to_row_major(ctx->h_V_hat_col_major.data(), ctx->N_work, ctx->k, ctx->host_result.U_row_major.data());
+        col_major_to_row_major(ctx->h_U_work_col_major.data(), ctx->M_work, ctx->k, ctx->host_result.V_row_major.data());
+    } else {
+        col_major_to_row_major(ctx->h_U_work_col_major.data(), ctx->M_work, ctx->k, ctx->host_result.U_row_major.data());
+        col_major_to_row_major(ctx->h_V_hat_col_major.data(), ctx->N_work, ctx->k, ctx->host_result.V_row_major.data());
+    }
+}
+
+void run_svd_pipeline(
+    SVDLowrankCUDAContext* ctx,
+    const float* A_row_major,
+    unsigned long long seed,
+    bool copy_result) {
+    load_and_transpose_input(ctx, A_row_major);
+    run_lowrank_compute(ctx, seed);
+    if (copy_result) {
+        copy_result_to_host(ctx);
+    } else {
+        check_cuda(cudaStreamSynchronize(ctx->stream), "cudaStreamSynchronize after warmup failed");
+    }
 }
 
 } // namespace
 
-void svd_lowrank_cuda_initialize(int m, int n, int q, unsigned long long warmup_seed) {
+void svd_lowrank_cuda_initialize(int m, int n, int q, int niter, unsigned long long warmup_seed) {
     if (m <= 0 || n <= 0) {
         throw std::invalid_argument("m and n must be positive");
     }
     if (q <= 0) {
         throw std::invalid_argument("q must be positive");
+    }
+    if (niter < 0) {
+        throw std::invalid_argument("niter must be non-negative");
     }
 
     svd_lowrank_cuda_release();
@@ -292,6 +470,7 @@ void svd_lowrank_cuda_initialize(int m, int n, int q, unsigned long long warmup_
     g_ctx.is_transposed = (m < n);
     g_ctx.M_work = g_ctx.is_transposed ? n : m;
     g_ctx.N_work = g_ctx.is_transposed ? m : n;
+    g_ctx.niter = niter;
 
     g_ctx.h_U_work_col_major.resize(static_cast<std::size_t>(g_ctx.M_work) * g_ctx.k);
     g_ctx.h_V_hat_col_major.resize(static_cast<std::size_t>(g_ctx.N_work) * g_ctx.k);
@@ -303,10 +482,14 @@ void svd_lowrank_cuda_initialize(int m, int n, int q, unsigned long long warmup_
     g_ctx.host_result.V_row_major.resize(static_cast<std::size_t>(n) * g_ctx.k);
 
     try {
+        check_cuda(cudaStreamCreateWithFlags(&g_ctx.stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags failed");
         check_cublas(cublasCreate(&g_ctx.cublasH), "cublasCreate failed");
         check_cusolver(cusolverDnCreate(&g_ctx.cusolverH), "cusolverDnCreate failed");
         check_curand(curandCreateGenerator(&g_ctx.curandGen, CURAND_RNG_PSEUDO_DEFAULT), "curandCreateGenerator failed");
         check_cusolver(cusolverDnCreateGesvdjInfo(&g_ctx.svdj_params), "cusolverDnCreateGesvdjInfo failed");
+        check_cublas(cublasSetStream(g_ctx.cublasH, g_ctx.stream), "cublasSetStream failed");
+        check_cusolver(cusolverDnSetStream(g_ctx.cusolverH, g_ctx.stream), "cusolverDnSetStream failed");
+        check_curand(curandSetStream(g_ctx.curandGen, g_ctx.stream), "curandSetStream failed");
 
         check_cuda(cudaMalloc(&g_ctx.d.d_A_row_major, static_cast<std::size_t>(m) * n * sizeof(float)),
                    "cudaMalloc d_A_row_major failed");
@@ -335,7 +518,16 @@ void svd_lowrank_cuda_initialize(int m, int n, int q, unsigned long long warmup_
         check_cuda(cudaMalloc(&g_ctx.d.d_devInfo, sizeof(int)), "cudaMalloc d_devInfo failed");
 
         initialize_workspace_and_lwork(&g_ctx);
-        run_warmup(&g_ctx, warmup_seed);
+
+        // Warm up kernels/handles once before graph capture.
+        load_and_transpose_input(&g_ctx, nullptr);
+        set_rng_seed(&g_ctx, warmup_seed);
+        run_lowrank_compute_body(&g_ctx, g_ctx.niter);
+        check_cuda(cudaStreamSynchronize(g_ctx.stream), "cudaStreamSynchronize after warmup failed");
+
+        // Capture once during initialization; this module requires graph replay for execution.
+        set_rng_seed(&g_ctx, warmup_seed);
+        capture_lowrank_graph_or_throw(&g_ctx, g_ctx.niter);
 
         g_ctx.initialized = true;
     } catch (...) {
@@ -348,328 +540,13 @@ void svd_lowrank_cuda_release() {
     g_ctx.destroy_all();
 }
 
-const SVDLowrankCPUResult& svd_lowrank_cuda(const float* A_row_major, int niter, unsigned long long seed, SVDLowrankTimings* timings) {
+const SVDLowrankCPUResult& svd_lowrank_cuda(const float* A_row_major, unsigned long long seed) {
     if (!g_ctx.initialized) {
-        throw std::logic_error("svd_lowrank_cuda is not initialized; call svd_lowrank_cuda_initialize(m, n, q) first");
+        throw std::logic_error("svd_lowrank_cuda is not initialized; call svd_lowrank_cuda_initialize(m, n, q, niter) first");
     }
     if (A_row_major == nullptr) {
         throw std::invalid_argument("A_row_major must not be null");
     }
-
-    const int iters = std::max(0, niter);
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    auto h2d_start = std::chrono::high_resolution_clock::now();
-    check_cuda(cudaMemcpy(g_ctx.d.d_A_row_major,
-                          A_row_major,
-                          static_cast<std::size_t>(g_ctx.m) * g_ctx.n * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy H2D A failed");
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after H2D failed");
-    auto h2d_end = std::chrono::high_resolution_clock::now();
-
-    cudaEvent_t ev_transpose_start = nullptr;
-    cudaEvent_t ev_transpose_stop = nullptr;
-    float transpose_ms_f = 0.0f;
-
-    check_cuda(cudaEventCreate(&ev_transpose_start), "cudaEventCreate transpose start failed");
-    check_cuda(cudaEventCreate(&ev_transpose_stop), "cudaEventCreate transpose stop failed");
-    check_cuda(cudaEventRecord(ev_transpose_start), "cudaEventRecord transpose start failed");
-
-    constexpr int TILE = 16;
-    const dim3 transpose_block(TILE, TILE);
-    const dim3 transpose_grid((g_ctx.n + TILE - 1) / TILE, (g_ctx.m + TILE - 1) / TILE);
-    transpose_row_to_col_kernel<<<transpose_grid, transpose_block>>>(g_ctx.d.d_A_row_major, g_ctx.d.d_A, g_ctx.m, g_ctx.n);
-    check_cuda(cudaGetLastError(), "transpose kernel launch failed");
-
-    check_cuda(cudaEventRecord(ev_transpose_stop), "cudaEventRecord transpose stop failed");
-    check_cuda(cudaEventSynchronize(ev_transpose_stop), "cudaEventSynchronize transpose stop failed");
-    check_cuda(cudaEventElapsedTime(&transpose_ms_f, ev_transpose_start, ev_transpose_stop),
-               "cudaEventElapsedTime transpose failed");
-    check_cuda(cudaEventDestroy(ev_transpose_start), "cudaEventDestroy transpose start failed");
-    check_cuda(cudaEventDestroy(ev_transpose_stop), "cudaEventDestroy transpose stop failed");
-
-    cudaEvent_t ev_compute_start = nullptr;
-    cudaEvent_t ev_compute_stop = nullptr;
-    float compute_ms_f = 0.0f;
-
-    try {
-        check_cuda(cudaEventCreate(&ev_compute_start), "cudaEventCreate start failed");
-        check_cuda(cudaEventCreate(&ev_compute_stop), "cudaEventCreate stop failed");
-        check_cuda(cudaEventRecord(ev_compute_start), "cudaEventRecord start failed");
-
-        const cublasOperation_t op_A = g_ctx.is_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
-        const cublasOperation_t op_A_H = g_ctx.is_transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        g_ctx.h_info = 0;
-
-        check_curand(curandSetPseudoRandomGeneratorSeed(g_ctx.curandGen, seed),
-                     "curandSetPseudoRandomGeneratorSeed failed");
-        check_curand(curandGenerateNormal(g_ctx.curandGen,
-                                          g_ctx.d.d_R,
-                                          static_cast<std::size_t>(g_ctx.N_work) * g_ctx.k,
-                                          0.0f,
-                                          1.0f),
-                     "curandGenerateNormal failed");
-
-        check_cublas(cublasSgemm(g_ctx.cublasH,
-                                 op_A,
-                                 CUBLAS_OP_N,
-                                 g_ctx.M_work,
-                                 g_ctx.k,
-                                 g_ctx.N_work,
-                                 &alpha,
-                                 g_ctx.d.d_A,
-                                 g_ctx.m,
-                                 g_ctx.d.d_R,
-                                 g_ctx.N_work,
-                                 &beta,
-                                 g_ctx.d.d_X,
-                                 g_ctx.M_work),
-                     "Initial cublasSgemm A*R failed");
-
-        check_cusolver(cusolverDnSgeqrf(g_ctx.cusolverH,
-                                        g_ctx.M_work,
-                                        g_ctx.k,
-                                        g_ctx.d.d_X,
-                                        g_ctx.M_work,
-                                        g_ctx.d.d_tau_M,
-                                        g_ctx.d.d_work,
-                                        g_ctx.lwork,
-                                        g_ctx.d.d_devInfo),
-                       "cusolverDnSgeqrf initial failed");
-        check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                   "Memcpy devInfo geqrf failed");
-        check_devinfo(g_ctx.h_info, "Initial geqrf failed");
-
-        check_cuda(cudaMemcpy(g_ctx.d.d_Q,
-                              g_ctx.d.d_X,
-                              static_cast<std::size_t>(g_ctx.M_work) * g_ctx.k * sizeof(float),
-                              cudaMemcpyDeviceToDevice),
-                   "Memcpy X->Q failed");
-        check_cusolver(cusolverDnSorgqr(g_ctx.cusolverH,
-                                        g_ctx.M_work,
-                                        g_ctx.k,
-                                        g_ctx.k,
-                                        g_ctx.d.d_Q,
-                                        g_ctx.M_work,
-                                        g_ctx.d.d_tau_M,
-                                        g_ctx.d.d_work,
-                                        g_ctx.lwork,
-                                        g_ctx.d.d_devInfo),
-                       "cusolverDnSorgqr initial failed");
-        check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                   "Memcpy devInfo orgqr failed");
-        check_devinfo(g_ctx.h_info, "Initial orgqr failed");
-
-        for (int i = 0; i < iters; ++i) {
-            check_cublas(cublasSgemm(g_ctx.cublasH,
-                                     op_A_H,
-                                     CUBLAS_OP_N,
-                                     g_ctx.N_work,
-                                     g_ctx.k,
-                                     g_ctx.M_work,
-                                     &alpha,
-                                     g_ctx.d.d_A,
-                                     g_ctx.m,
-                                     g_ctx.d.d_Q,
-                                     g_ctx.M_work,
-                                     &beta,
-                                     g_ctx.d.d_X_temp,
-                                     g_ctx.N_work),
-                         "Power iteration forward gemm failed");
-
-            check_cusolver(cusolverDnSgeqrf(g_ctx.cusolverH,
-                                            g_ctx.N_work,
-                                            g_ctx.k,
-                                            g_ctx.d.d_X_temp,
-                                            g_ctx.N_work,
-                                            g_ctx.d.d_tau_N,
-                                            g_ctx.d.d_work,
-                                            g_ctx.lwork,
-                                            g_ctx.d.d_devInfo),
-                           "Power geqrf N failed");
-            check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                       "Memcpy devInfo power geqrf N failed");
-            check_devinfo(g_ctx.h_info, "Power geqrf N failed");
-
-            check_cuda(cudaMemcpy(g_ctx.d.d_Q_temp,
-                                  g_ctx.d.d_X_temp,
-                                  static_cast<std::size_t>(g_ctx.N_work) * g_ctx.k * sizeof(float),
-                                  cudaMemcpyDeviceToDevice),
-                       "Memcpy X_temp->Q_temp failed");
-            check_cusolver(cusolverDnSorgqr(g_ctx.cusolverH,
-                                            g_ctx.N_work,
-                                            g_ctx.k,
-                                            g_ctx.k,
-                                            g_ctx.d.d_Q_temp,
-                                            g_ctx.N_work,
-                                            g_ctx.d.d_tau_N,
-                                            g_ctx.d.d_work,
-                                            g_ctx.lwork,
-                                            g_ctx.d.d_devInfo),
-                           "Power orgqr N failed");
-            check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                       "Memcpy devInfo power orgqr N failed");
-            check_devinfo(g_ctx.h_info, "Power orgqr N failed");
-
-            check_cublas(cublasSgemm(g_ctx.cublasH,
-                                     op_A,
-                                     CUBLAS_OP_N,
-                                     g_ctx.M_work,
-                                     g_ctx.k,
-                                     g_ctx.N_work,
-                                     &alpha,
-                                     g_ctx.d.d_A,
-                                     g_ctx.m,
-                                     g_ctx.d.d_Q_temp,
-                                     g_ctx.N_work,
-                                     &beta,
-                                     g_ctx.d.d_X,
-                                     g_ctx.M_work),
-                         "Power iteration backward gemm failed");
-
-            check_cusolver(cusolverDnSgeqrf(g_ctx.cusolverH,
-                                            g_ctx.M_work,
-                                            g_ctx.k,
-                                            g_ctx.d.d_X,
-                                            g_ctx.M_work,
-                                            g_ctx.d.d_tau_M,
-                                            g_ctx.d.d_work,
-                                            g_ctx.lwork,
-                                            g_ctx.d.d_devInfo),
-                           "Power geqrf M failed");
-            check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                       "Memcpy devInfo power geqrf M failed");
-            check_devinfo(g_ctx.h_info, "Power geqrf M failed");
-
-            check_cuda(cudaMemcpy(g_ctx.d.d_Q,
-                                  g_ctx.d.d_X,
-                                  static_cast<std::size_t>(g_ctx.M_work) * g_ctx.k * sizeof(float),
-                                  cudaMemcpyDeviceToDevice),
-                       "Memcpy X->Q in power failed");
-            check_cusolver(cusolverDnSorgqr(g_ctx.cusolverH,
-                                            g_ctx.M_work,
-                                            g_ctx.k,
-                                            g_ctx.k,
-                                            g_ctx.d.d_Q,
-                                            g_ctx.M_work,
-                                            g_ctx.d.d_tau_M,
-                                            g_ctx.d.d_work,
-                                            g_ctx.lwork,
-                                            g_ctx.d.d_devInfo),
-                           "Power orgqr M failed");
-            check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                       "Memcpy devInfo power orgqr M failed");
-            check_devinfo(g_ctx.h_info, "Power orgqr M failed");
-        }
-
-        check_cublas(cublasSgemm(g_ctx.cublasH,
-                                 CUBLAS_OP_T,
-                                 op_A,
-                                 g_ctx.k,
-                                 g_ctx.N_work,
-                                 g_ctx.M_work,
-                                 &alpha,
-                                 g_ctx.d.d_Q,
-                                 g_ctx.M_work,
-                                 g_ctx.d.d_A,
-                                 g_ctx.m,
-                                 &beta,
-                                 g_ctx.d.d_B,
-                                 g_ctx.k),
-                     "Projection gemm Q^T A failed");
-
-        check_cusolver(cusolverDnSgesvdj(
-                           g_ctx.cusolverH,
-                           CUSOLVER_EIG_MODE_VECTOR,
-                           1,
-                           g_ctx.k,
-                           g_ctx.N_work,
-                           g_ctx.d.d_B,
-                           g_ctx.k,
-                           g_ctx.d.d_S,
-                           g_ctx.d.d_U_hat,
-                           g_ctx.k,
-                           g_ctx.d.d_V_hat,
-                           g_ctx.N_work,
-                           g_ctx.d.d_work,
-                           g_ctx.lwork,
-                           g_ctx.d.d_devInfo,
-                           g_ctx.svdj_params),
-                       "cusolverDnSgesvdj failed");
-        check_cuda(cudaMemcpy(&g_ctx.h_info, g_ctx.d.d_devInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                   "Memcpy devInfo gesvdj failed");
-        check_devinfo(g_ctx.h_info, "gesvdj failed");
-
-        check_cublas(cublasSgemm(g_ctx.cublasH,
-                                 CUBLAS_OP_N,
-                                 CUBLAS_OP_N,
-                                 g_ctx.M_work,
-                                 g_ctx.k,
-                                 g_ctx.k,
-                                 &alpha,
-                                 g_ctx.d.d_Q,
-                                 g_ctx.M_work,
-                                 g_ctx.d.d_U_hat,
-                                 g_ctx.k,
-                                 &beta,
-                                 g_ctx.d.d_U_work,
-                                 g_ctx.M_work),
-                     "Recover U_work gemm failed");
-
-        check_cuda(cudaEventRecord(ev_compute_stop), "cudaEventRecord stop failed");
-        check_cuda(cudaEventSynchronize(ev_compute_stop), "cudaEventSynchronize stop failed");
-        check_cuda(cudaEventElapsedTime(&compute_ms_f, ev_compute_start, ev_compute_stop), "cudaEventElapsedTime failed");
-    } catch (...) {
-        if (ev_compute_start) {
-            cudaEventDestroy(ev_compute_start);
-        }
-        if (ev_compute_stop) {
-            cudaEventDestroy(ev_compute_stop);
-        }
-        throw;
-    }
-
-    check_cuda(cudaEventDestroy(ev_compute_start), "cudaEventDestroy start failed");
-    check_cuda(cudaEventDestroy(ev_compute_stop), "cudaEventDestroy stop failed");
-
-    auto d2h_start = std::chrono::high_resolution_clock::now();
-    check_cuda(cudaMemcpy(g_ctx.h_U_work_col_major.data(),
-                          g_ctx.d.d_U_work,
-                          static_cast<std::size_t>(g_ctx.M_work) * g_ctx.k * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "Memcpy U_work D2H failed");
-    check_cuda(cudaMemcpy(g_ctx.h_V_hat_col_major.data(),
-                          g_ctx.d.d_V_hat,
-                          static_cast<std::size_t>(g_ctx.N_work) * g_ctx.k * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "Memcpy V_hat D2H failed");
-    check_cuda(cudaMemcpy(g_ctx.host_result.S.data(),
-                          g_ctx.d.d_S,
-                          static_cast<std::size_t>(g_ctx.k) * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "Memcpy S D2H failed");
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after D2H failed");
-    auto d2h_end = std::chrono::high_resolution_clock::now();
-
-    if (g_ctx.is_transposed) {
-        col_major_to_row_major(g_ctx.h_V_hat_col_major.data(), g_ctx.N_work, g_ctx.k, g_ctx.host_result.U_row_major.data());
-        col_major_to_row_major(g_ctx.h_U_work_col_major.data(), g_ctx.M_work, g_ctx.k, g_ctx.host_result.V_row_major.data());
-    } else {
-        col_major_to_row_major(g_ctx.h_U_work_col_major.data(), g_ctx.M_work, g_ctx.k, g_ctx.host_result.U_row_major.data());
-        col_major_to_row_major(g_ctx.h_V_hat_col_major.data(), g_ctx.N_work, g_ctx.k, g_ctx.host_result.V_row_major.data());
-    }
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    if (timings != nullptr) {
-        timings->h2d_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
-        timings->transpose_ms = static_cast<double>(transpose_ms_f);
-        timings->compute_ms = static_cast<double>(compute_ms_f);
-        timings->d2h_ms = std::chrono::duration<double, std::milli>(d2h_end - d2h_start).count();
-        timings->total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    }
-
+    run_svd_pipeline(&g_ctx, A_row_major, seed, true);
     return g_ctx.host_result;
 }

@@ -10,6 +10,18 @@ target_link_libraries(svd_lowrank_cuda_tests
         svd_lowrank_cuda_lib
 )
 
+function(add_reconstruct_lowrank_cuda_test target_name source_file)
+    add_executable(${target_name})
+    target_sources(${target_name}
+        PRIVATE
+            ${source_file}
+    )
+    target_link_libraries(${target_name}
+        PRIVATE
+            reconstruct_lowrank_cuda_lib
+    )
+endfunction()
+
 function(add_quantization_test target_name source_file)
     add_executable(${target_name})
     target_sources(${target_name}
@@ -34,6 +46,18 @@ function(add_topk_test target_name source_file)
     )
 endfunction()
 
+function(add_bitsqz_llm_test target_name source_file)
+    add_executable(${target_name})
+    target_sources(${target_name}
+        PRIVATE
+            ${source_file}
+    )
+    target_link_libraries(${target_name}
+        PRIVATE
+            bitsqz_llm_lib
+    )
+endfunction()
+
 add_quantization_test(quantization_q8_0_tests quantization/test_q8_0_impl.cpp)
 add_quantization_test(quantization_q4_0_tests quantization/test_q4_0_impl.cpp)
 add_quantization_test(quantization_q2_k_tests quantization/test_q2_k_impl.cpp)
@@ -50,3 +74,8 @@ add_quantization_test(quantization_nf4_dq_tests quantization/test_nf4_dq_impl.cp
 
 add_topk_test(topk_extraction_tests topk/test_topk_extraction.cpp)
 add_topk_test(topk_separation_tests topk/test_topk_separation.cpp)
+
+add_bitsqz_llm_test(bitsqz_llm_quantization_tests bitsqz_llm/test_quantization.cpp)
+add_bitsqz_llm_test(bitsqz_llm_svd_tests bitsqz_llm/test_svd.cpp)
+
+add_reconstruct_lowrank_cuda_test(reconstruct_lowrank_cuda_tests reconstruct_lowrank_cuda/test_reconstruct_lowrank_cuda.cu)

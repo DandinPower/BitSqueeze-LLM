@@ -100,11 +100,10 @@ int main() {
 
                 auto A = make_low_rank_matrix(m, n, true_rank, seed);
 
-                svd_lowrank_cuda_initialize(m, n, q, seed + 1ULL);
+                svd_lowrank_cuda_initialize(m, n, q, niter, seed + 1ULL);
 
-                SVDLowrankTimings device_timings;
                 const auto wall_start = std::chrono::high_resolution_clock::now();
-                const SVDLowrankCPUResult& svd = svd_lowrank_cuda(A.data(), niter, seed + 7ULL, &device_timings);
+                const SVDLowrankCPUResult& svd = svd_lowrank_cuda(A.data(), seed + 7ULL);
                 const auto wall_end = std::chrono::high_resolution_clock::now();
                 const double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
 
@@ -117,11 +116,6 @@ int main() {
                           << " | MAE=" << mae
                           << " | MSE=" << mse
                           << " | wall_ms=" << wall_ms
-                          << " | h2d_ms=" << device_timings.h2d_ms
-                          << " | transpose_ms=" << device_timings.transpose_ms
-                          << " | compute_ms=" << device_timings.compute_ms
-                          << " | d2h_ms=" << device_timings.d2h_ms
-                          << " | total_ms=" << device_timings.total_ms
                           << '\n';
 
                 svd_lowrank_cuda_release();
