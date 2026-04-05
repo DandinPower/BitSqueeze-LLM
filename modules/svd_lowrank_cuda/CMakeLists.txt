@@ -5,12 +5,6 @@ add_library(svd_lowrank_cuda_lib)
 target_sources(svd_lowrank_cuda_lib
     PRIVATE
         src/svd_lowrank_cuda.cu
-
-    # PUBLIC
-    #     FILE_SET HEADERS 
-    #     BASE_DIRS include
-    #     FILES 
-    #         include/svd_lowrank_cuda/svd_lowrank_cuda.h
 )
 
 target_include_directories(svd_lowrank_cuda_lib
