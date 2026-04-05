@@ -2,35 +2,17 @@
 
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 struct ReconstructLowrankCUDAPtrs {
-    float *d_U = nullptr;
-    float *d_S = nullptr;
-    float *d_V = nullptr;
-    float *d_result = nullptr;
+    float *d_scaled_u = nullptr;
 
     void free_all() noexcept {
-        cudaFree(d_U);
-        cudaFree(d_S);
-        cudaFree(d_V);
-        cudaFree(d_result);
+        if (d_scaled_u) cudaFree(d_scaled_u);
 
-        d_U = nullptr;
-        d_S = nullptr;
-        d_V = nullptr;
-        d_result = nullptr;
-    }
-};
-
-struct ReconstructLowrankHostPtrs {
-    std::vector<float> h_result;
-
-    void free_all() noexcept {
-        h_result.clear();
+        d_scaled_u = nullptr;
     }
 };
 
@@ -40,17 +22,20 @@ struct ReconstructLowrankCUDAContext {
     int k = 0;
     bool initialized = false;
 
+    cudaStream_t stream = nullptr;
     cublasHandle_t cublas_handler = nullptr;
     ReconstructLowrankCUDAPtrs cuda_ptrs;
-    ReconstructLowrankHostPtrs host_ptrs;
 
     void destroy_all() noexcept {
         cuda_ptrs.free_all();
-        host_ptrs.free_all();
 
         if (cublas_handler) {
             cublasDestroy(cublas_handler);
             cublas_handler = nullptr;
+        }
+        if (stream) {
+            cudaStreamDestroy(stream);
+            stream = nullptr;
         }
 
         m = 0;
@@ -87,7 +72,7 @@ void reconstruct_lowrank_cuda_initialize(
 
 void reconstruct_lowrank_cuda(
     ReconstructLowrankCUDAContext* ctx,
-    const std::vector<float>& U_row_major,
-    const std::vector<float>& S,
-    const std::vector<float>& V_row_major,
-    std::vector<float>* out_row_major);
+    const float* d_U_row_major,
+    const float* d_S,
+    const float* d_V_row_major,
+    float* d_out_row_major);

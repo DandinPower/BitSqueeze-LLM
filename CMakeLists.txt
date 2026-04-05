@@ -4,6 +4,8 @@ project(svd_lowrank_cuda LANGUAGES CXX CUDA)
 
 set(CMAKE_CUDA_ARCHITECTURES 80)    # Compile the generation after A100 (https://developer.nvidia.com/cuda/gpus)
 
+find_package(CUDAToolkit REQUIRED)
+
 add_subdirectory(tests)
 
 add_subdirectory(modules/quantization)
@@ -32,6 +34,8 @@ target_link_libraries(bitsqz_llm_lib
         topk_lib
         svd_lowrank_cuda_lib
         reconstruct_lowrank_cuda_lib
+    PRIVATE
+        CUDA::cudart
 )
 if(OpenMP_CXX_FOUND)
     target_link_libraries(bitsqz_llm_lib PUBLIC OpenMP::OpenMP_CXX)

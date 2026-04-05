@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cuda_runtime.h>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -18,6 +21,26 @@ constexpr int kN = 8192;
 constexpr int kWarmupIters = 5;
 constexpr int kMeasureIters = 30;
 constexpr unsigned long long kSeed = 20260405ULL;
+
+struct ScopedDeviceBuffers {
+    float *d_U = nullptr;
+    float *d_S = nullptr;
+    float *d_V = nullptr;
+    float *d_out = nullptr;
+
+    ~ScopedDeviceBuffers() {
+        cudaFree(d_U);
+        cudaFree(d_S);
+        cudaFree(d_V);
+        cudaFree(d_out);
+    }
+};
+
+void check_cuda(cudaError_t status, const char* msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
 
 float compute_reference_entry(const std::vector<float>& U,
                               const std::vector<float>& S,
@@ -35,6 +58,7 @@ float compute_reference_entry(const std::vector<float>& U,
 
 int main() {
     ReconstructLowrankCUDAContext ctx;
+    ScopedDeviceBuffers buffers;
 
     try {
         std::mt19937 gen(static_cast<std::mt19937::result_type>(kSeed));
@@ -57,23 +81,87 @@ int main() {
         }
 
         reconstruct_lowrank_cuda_initialize(&ctx, kM, kN, kK, kSeed + 1ULL);
+        check_cuda(cudaMalloc(&buffers.d_U, static_cast<std::size_t>(kM) * kK * sizeof(float)), "cudaMalloc d_U failed");
+        check_cuda(cudaMalloc(&buffers.d_S, static_cast<std::size_t>(kK) * sizeof(float)), "cudaMalloc d_S failed");
+        check_cuda(cudaMalloc(&buffers.d_V, static_cast<std::size_t>(kN) * kK * sizeof(float)), "cudaMalloc d_V failed");
+        check_cuda(cudaMalloc(&buffers.d_out, static_cast<std::size_t>(kM) * kN * sizeof(float)), "cudaMalloc d_out failed");
+        check_cuda(cudaMemcpy(
+                       buffers.d_U,
+                       U.data(),
+                       static_cast<std::size_t>(kM) * kK * sizeof(float),
+                       cudaMemcpyHostToDevice),
+                   "cudaMemcpy U H2D failed");
+        check_cuda(cudaMemcpy(
+                       buffers.d_S,
+                       S.data(),
+                       static_cast<std::size_t>(kK) * sizeof(float),
+                       cudaMemcpyHostToDevice),
+                   "cudaMemcpy S H2D failed");
+        check_cuda(cudaMemcpy(
+                       buffers.d_V,
+                       V.data(),
+                       static_cast<std::size_t>(kN) * kK * sizeof(float),
+                       cudaMemcpyHostToDevice),
+                   "cudaMemcpy V H2D failed");
 
-        std::vector<float> out;
+        std::vector<float> out(static_cast<std::size_t>(kM) * kN, 0.0f);
         for (int i = 0; i < kWarmupIters; ++i) {
-            reconstruct_lowrank_cuda(&ctx, U, S, V, &out);
+            reconstruct_lowrank_cuda(&ctx, buffers.d_U, buffers.d_S, buffers.d_V, buffers.d_out);
         }
 
         std::vector<double> latencies_ms;
         latencies_ms.reserve(kMeasureIters);
         for (int i = 0; i < kMeasureIters; ++i) {
             const auto begin = std::chrono::high_resolution_clock::now();
-            reconstruct_lowrank_cuda(&ctx, U, S, V, &out);
+            reconstruct_lowrank_cuda(&ctx, buffers.d_U, buffers.d_S, buffers.d_V, buffers.d_out);
             const auto end = std::chrono::high_resolution_clock::now();
             latencies_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
         }
+        check_cuda(cudaMemcpy(
+                       out.data(),
+                       buffers.d_out,
+                       out.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy out D2H failed");
 
         if (out.size() != static_cast<std::size_t>(kM) * kN) {
             throw std::runtime_error("output size mismatch");
+        }
+
+        std::vector<float> U_after(U.size(), 0.0f);
+        std::vector<float> S_after(S.size(), 0.0f);
+        std::vector<float> V_after(V.size(), 0.0f);
+        check_cuda(cudaMemcpy(
+                       U_after.data(),
+                       buffers.d_U,
+                       U_after.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy U D2H failed");
+        check_cuda(cudaMemcpy(
+                       S_after.data(),
+                       buffers.d_S,
+                       S_after.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy S D2H failed");
+        check_cuda(cudaMemcpy(
+                       V_after.data(),
+                       buffers.d_V,
+                       V_after.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+                   "cudaMemcpy V D2H failed");
+
+        double max_input_drift = 0.0;
+        for (std::size_t i = 0; i < U.size(); ++i) {
+            max_input_drift = std::max(max_input_drift, std::abs(static_cast<double>(U[i]) - static_cast<double>(U_after[i])));
+        }
+        for (std::size_t i = 0; i < S.size(); ++i) {
+            max_input_drift = std::max(max_input_drift, std::abs(static_cast<double>(S[i]) - static_cast<double>(S_after[i])));
+        }
+        for (std::size_t i = 0; i < V.size(); ++i) {
+            max_input_drift = std::max(max_input_drift, std::abs(static_cast<double>(V[i]) - static_cast<double>(V_after[i])));
+        }
+        if (!std::isfinite(max_input_drift) || max_input_drift > 0.0) {
+            throw std::runtime_error("caller-owned input buffers were modified");
         }
 
         double max_abs_err = 0.0;

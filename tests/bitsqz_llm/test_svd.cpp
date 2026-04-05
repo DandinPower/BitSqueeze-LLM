@@ -66,8 +66,27 @@ int run_case(const char *name,
     }
     const double compress_latency_ms = elapsed_ms(compress_begin, Clock::now());
 
+    bitsqz_llm_release();
     std::vector<float> restored(source.size(), 0.0f);
     const auto decompress_begin = Clock::now();
+    if (bitsqz_llm_decompress(compressed, restored.data(), static_cast<uint32_t>(restored.size())) == 0) {
+        std::fprintf(stderr, "%s: decompress should fail without initialize\n", name);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
+    if (bitsqz_llm_initialize(rows,
+                              cols,
+                              outlier_ratio,
+                              error_ratio,
+                              rank,
+                              niters,
+                              uv_format,
+                              s_format,
+                              quantization_INVALID) != 0) {
+        std::fprintf(stderr, "%s: re-initialize before decompress failed\n", name);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
     if (bitsqz_llm_decompress(compressed, restored.data(), static_cast<uint32_t>(restored.size())) != 0) {
         std::fprintf(stderr, "%s: decompress failed\n", name);
         bitsqz_llm_free(compressed);
@@ -107,8 +126,23 @@ int run_case(const char *name,
         return 1;
     }
 
+    bitsqz_llm_release();
     std::vector<float> restored_after_load(source.size(), 0.0f);
     const auto decompress_reload_begin = Clock::now();
+    if (bitsqz_llm_initialize(rows,
+                              cols,
+                              outlier_ratio,
+                              error_ratio,
+                              rank,
+                              niters,
+                              uv_format,
+                              s_format,
+                              quantization_INVALID) != 0) {
+        std::fprintf(stderr, "%s: re-initialize before reload decompress failed\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
     if (bitsqz_llm_decompress(loaded, restored_after_load.data(), static_cast<uint32_t>(restored_after_load.size())) != 0) {
         std::fprintf(stderr, "%s: decompress after load failed\n", name);
         bitsqz_llm_free(loaded);

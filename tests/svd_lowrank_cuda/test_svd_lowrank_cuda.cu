@@ -4,13 +4,45 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
+
+struct HostSVDResult {
+    int m = 0;
+    int n = 0;
+    int k = 0;
+    std::vector<float> U_row_major;
+    std::vector<float> S;
+    std::vector<float> V_row_major;
+};
+
+struct ScopedDeviceBuffers {
+    float *d_A = nullptr;
+    float *d_U = nullptr;
+    float *d_S = nullptr;
+    float *d_V = nullptr;
+
+    ~ScopedDeviceBuffers() {
+        cudaFree(d_A);
+        cudaFree(d_U);
+        cudaFree(d_S);
+        cudaFree(d_V);
+    }
+};
+
+void check_cuda(cudaError_t status, const char* msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
 
 std::vector<float> matmul_row_major(const std::vector<float>& A, int m, int k, const std::vector<float>& B, int n) {
     std::vector<float> C(static_cast<std::size_t>(m) * n, 0.0f);
@@ -51,7 +83,7 @@ std::vector<float> make_low_rank_matrix(int m, int n, int rank, unsigned long lo
     return matmul_row_major(L, m, rank, R, n);
 }
 
-std::vector<float> reconstruct_from_svd(const SVDLowrankCPUResult& svd) {
+std::vector<float> reconstruct_from_svd(const HostSVDResult& svd) {
     std::vector<float> US(static_cast<std::size_t>(svd.m) * svd.k, 0.0f);
     for (int i = 0; i < svd.m; ++i) {
         for (int j = 0; j < svd.k; ++j) {
@@ -99,13 +131,50 @@ int main() {
                 std::cout << "\nCase m=" << m << ", n=" << n << ", true_rank=" << true_rank << '\n';
 
                 auto A = make_low_rank_matrix(m, n, true_rank, seed);
+                ScopedDeviceBuffers buffers;
+                HostSVDResult svd;
+                svd.m = m;
+                svd.n = n;
+                svd.k = q;
+                svd.U_row_major.resize(static_cast<std::size_t>(m) * q);
+                svd.S.resize(static_cast<std::size_t>(q));
+                svd.V_row_major.resize(static_cast<std::size_t>(n) * q);
+
+                check_cuda(cudaMalloc(&buffers.d_A, static_cast<std::size_t>(m) * n * sizeof(float)), "cudaMalloc d_A failed");
+                check_cuda(cudaMalloc(&buffers.d_U, static_cast<std::size_t>(m) * q * sizeof(float)), "cudaMalloc d_U failed");
+                check_cuda(cudaMalloc(&buffers.d_S, static_cast<std::size_t>(q) * sizeof(float)), "cudaMalloc d_S failed");
+                check_cuda(cudaMalloc(&buffers.d_V, static_cast<std::size_t>(n) * q * sizeof(float)), "cudaMalloc d_V failed");
+                check_cuda(cudaMemcpy(
+                               buffers.d_A,
+                               A.data(),
+                               static_cast<std::size_t>(m) * n * sizeof(float),
+                               cudaMemcpyHostToDevice),
+                           "cudaMemcpy A H2D failed");
 
                 svd_lowrank_cuda_initialize(m, n, q, niter, seed + 1ULL);
 
                 const auto wall_start = std::chrono::high_resolution_clock::now();
-                const SVDLowrankCPUResult& svd = svd_lowrank_cuda(A.data(), seed + 7ULL);
+                svd_lowrank_cuda(buffers.d_A, buffers.d_U, buffers.d_S, buffers.d_V, seed + 7ULL);
                 const auto wall_end = std::chrono::high_resolution_clock::now();
                 const double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+                check_cuda(cudaMemcpy(
+                               svd.U_row_major.data(),
+                               buffers.d_U,
+                               svd.U_row_major.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost),
+                           "cudaMemcpy U D2H failed");
+                check_cuda(cudaMemcpy(
+                               svd.S.data(),
+                               buffers.d_S,
+                               svd.S.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost),
+                           "cudaMemcpy S D2H failed");
+                check_cuda(cudaMemcpy(
+                               svd.V_row_major.data(),
+                               buffers.d_V,
+                               svd.V_row_major.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost),
+                           "cudaMemcpy V D2H failed");
 
                 const auto A_hat = reconstruct_from_svd(svd);
                 double mae = 0.0;

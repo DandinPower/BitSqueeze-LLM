@@ -1,5 +1,5 @@
+#include <cstddef>
 #include <string>
-#include <vector>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -11,7 +11,19 @@ namespace {
 using reconstruct_lowrank_cuda_detail::check_cublas;
 using reconstruct_lowrank_cuda_detail::check_cuda;
 
-void run_reconstruct_lowrank_cuda(ReconstructLowrankCUDAContext* ctx) {
+__global__ void fill_kernel(float* dst, std::size_t count, float value) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        dst[idx] = value;
+    }
+}
+
+void run_reconstruct_lowrank_cuda(
+    ReconstructLowrankCUDAContext* ctx,
+    const float* d_U_row_major,
+    const float* d_S,
+    const float* d_V_row_major,
+    float* d_out_row_major) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
@@ -21,11 +33,11 @@ void run_reconstruct_lowrank_cuda(ReconstructLowrankCUDAContext* ctx) {
         CUBLAS_SIDE_LEFT,
         ctx->k,
         ctx->m,
-        ctx->cuda_ptrs.d_U,
+        d_U_row_major,
         ctx->k,
-        ctx->cuda_ptrs.d_S,
+        d_S,
         1,
-        ctx->cuda_ptrs.d_U,
+        ctx->cuda_ptrs.d_scaled_u,
         ctx->k),
         "cublasSdgmm failed");
 
@@ -39,12 +51,12 @@ void run_reconstruct_lowrank_cuda(ReconstructLowrankCUDAContext* ctx) {
         ctx->m,
         ctx->k,
         &alpha,
-        ctx->cuda_ptrs.d_V,
+        d_V_row_major,
         ctx->k,
-        ctx->cuda_ptrs.d_U,
+        ctx->cuda_ptrs.d_scaled_u,
         ctx->k,
         &beta,
-        ctx->cuda_ptrs.d_result,
+        d_out_row_major,
         ctx->n),
         "cublasSgemm failed");
 }
@@ -52,28 +64,48 @@ void run_reconstruct_lowrank_cuda(ReconstructLowrankCUDAContext* ctx) {
 void warmup(ReconstructLowrankCUDAContext* ctx, unsigned long long warmup_seed) {
     (void) warmup_seed;
 
-    std::vector<float> U(static_cast<std::size_t>(ctx->m) * ctx->k, 1.0f);
-    std::vector<float> S(static_cast<std::size_t>(ctx->k), 1.0f);
-    std::vector<float> V(static_cast<std::size_t>(ctx->n) * ctx->k, 1.0f);
+    float* d_U = nullptr;
+    float* d_S = nullptr;
+    float* d_V = nullptr;
+    float* d_out = nullptr;
 
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_U,
-                          U.data(),
-                          static_cast<std::size_t>(ctx->m) * ctx->k * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "warmup cudaMemcpy U failed");
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_S,
-                          S.data(),
-                          static_cast<std::size_t>(ctx->k) * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "warmup cudaMemcpy S failed");
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_V,
-                          V.data(),
-                          static_cast<std::size_t>(ctx->n) * ctx->k * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "warmup cudaMemcpy V failed");
+    try {
+        const std::size_t u_count = static_cast<std::size_t>(ctx->m) * ctx->k;
+        const std::size_t s_count = static_cast<std::size_t>(ctx->k);
+        const std::size_t v_count = static_cast<std::size_t>(ctx->n) * ctx->k;
+        const std::size_t out_count = static_cast<std::size_t>(ctx->m) * ctx->n;
 
-    run_reconstruct_lowrank_cuda(ctx);
-    check_cuda(cudaDeviceSynchronize(), "warmup cudaDeviceSynchronize failed");
+        check_cuda(cudaMalloc(&d_U, u_count * sizeof(float)), "warmup cudaMalloc d_U failed");
+        check_cuda(cudaMalloc(&d_S, s_count * sizeof(float)), "warmup cudaMalloc d_S failed");
+        check_cuda(cudaMalloc(&d_V, v_count * sizeof(float)), "warmup cudaMalloc d_V failed");
+        check_cuda(cudaMalloc(&d_out, out_count * sizeof(float)), "warmup cudaMalloc d_out failed");
+
+        constexpr int kBlockSize = 256;
+        const auto launch_fill = [&](float* ptr, std::size_t count) {
+            const int grid = static_cast<int>((count + kBlockSize - 1) / kBlockSize);
+            fill_kernel<<<grid, kBlockSize, 0, ctx->stream>>>(ptr, count, 1.0f);
+            check_cuda(cudaGetLastError(), "warmup fill kernel launch failed");
+        };
+
+        launch_fill(d_U, u_count);
+        launch_fill(d_S, s_count);
+        launch_fill(d_V, v_count);
+        launch_fill(d_out, out_count);
+
+        run_reconstruct_lowrank_cuda(ctx, d_U, d_S, d_V, d_out);
+        check_cuda(cudaStreamSynchronize(ctx->stream), "warmup cudaStreamSynchronize failed");
+    } catch (...) {
+        cudaFree(d_U);
+        cudaFree(d_S);
+        cudaFree(d_V);
+        cudaFree(d_out);
+        throw;
+    }
+
+    cudaFree(d_U);
+    cudaFree(d_S);
+    cudaFree(d_V);
+    cudaFree(d_out);
 }
 
 }  // namespace
@@ -103,14 +135,13 @@ void reconstruct_lowrank_cuda_initialize(
     ctx->m = m;
     ctx->n = n;
     ctx->k = k;
-    ctx->host_ptrs.h_result.resize(static_cast<std::size_t>(m) * n);
 
     try {
+        check_cuda(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags failed");
         check_cublas(cublasCreate(&ctx->cublas_handler), "cublasCreate failed");
-        check_cuda(cudaMalloc(&ctx->cuda_ptrs.d_U, static_cast<std::size_t>(m) * k * sizeof(float)), "cudaMalloc d_U failed");
-        check_cuda(cudaMalloc(&ctx->cuda_ptrs.d_S, static_cast<std::size_t>(k) * sizeof(float)), "cudaMalloc d_S failed");
-        check_cuda(cudaMalloc(&ctx->cuda_ptrs.d_V, static_cast<std::size_t>(n) * k * sizeof(float)), "cudaMalloc d_V failed");
-        check_cuda(cudaMalloc(&ctx->cuda_ptrs.d_result, static_cast<std::size_t>(m) * n * sizeof(float)), "cudaMalloc d_result failed");
+        check_cublas(cublasSetStream(ctx->cublas_handler, ctx->stream), "cublasSetStream failed");
+        check_cuda(cudaMalloc(&ctx->cuda_ptrs.d_scaled_u, static_cast<std::size_t>(m) * k * sizeof(float)),
+                   "cudaMalloc d_scaled_u failed");
         warmup(ctx, warmup_seed);
         ctx->initialized = true;
     } catch (...) {
@@ -121,44 +152,20 @@ void reconstruct_lowrank_cuda_initialize(
 
 void reconstruct_lowrank_cuda(
     ReconstructLowrankCUDAContext* ctx,
-    const std::vector<float>& U_row_major,
-    const std::vector<float>& S,
-    const std::vector<float>& V_row_major,
-    std::vector<float>* out_row_major) {
+    const float* d_U_row_major,
+    const float* d_S,
+    const float* d_V_row_major,
+    float* d_out_row_major) {
     if (ctx == nullptr) {
         throw std::invalid_argument("ctx must not be null");
     }
     if (!ctx->initialized) {
         throw std::runtime_error("context is not initialized");
     }
-    if (out_row_major == nullptr) {
-        throw std::invalid_argument("out_row_major must not be null");
+    if (d_U_row_major == nullptr || d_S == nullptr || d_V_row_major == nullptr || d_out_row_major == nullptr) {
+        throw std::invalid_argument("device pointers must not be null");
     }
 
-    const std::size_t m = static_cast<std::size_t>(ctx->m);
-    const std::size_t n = static_cast<std::size_t>(ctx->n);
-    const std::size_t k = static_cast<std::size_t>(ctx->k);
-
-    if (U_row_major.size() != m * k) {
-        throw std::invalid_argument("U_row_major size mismatch");
-    }
-    if (S.size() != k) {
-        throw std::invalid_argument("S size mismatch");
-    }
-    if (V_row_major.size() != n * k) {
-        throw std::invalid_argument("V_row_major size mismatch");
-    }
-
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_U, U_row_major.data(), m * k * sizeof(float), cudaMemcpyHostToDevice),
-               "cudaMemcpy U failed");
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_S, S.data(), k * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy S failed");
-    check_cuda(cudaMemcpyAsync(ctx->cuda_ptrs.d_V, V_row_major.data(), n * k * sizeof(float), cudaMemcpyHostToDevice),
-               "cudaMemcpy V failed");
-
-    run_reconstruct_lowrank_cuda(ctx);
-
-    out_row_major->resize(m * n);
-    check_cuda(cudaMemcpyAsync(out_row_major->data(), ctx->cuda_ptrs.d_result, m * n * sizeof(float), cudaMemcpyDeviceToHost),
-               "cudaMemcpy result failed");
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize failed");
+    run_reconstruct_lowrank_cuda(ctx, d_U_row_major, d_S, d_V_row_major, d_out_row_major);
+    check_cuda(cudaStreamSynchronize(ctx->stream), "cudaStreamSynchronize failed");
 }

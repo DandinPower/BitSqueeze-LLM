@@ -7,9 +7,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 #include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.hpp>
 #include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
@@ -23,6 +27,28 @@ enum : uint32_t {
     BITSQZ_FLAG_HAS_ERROR_TOPK = 1u << 2,
 };
 
+struct BitsqzCUDADeviceBuffers {
+    float *d_matrix = nullptr;
+    float *d_u = nullptr;
+    float *d_s = nullptr;
+    float *d_v = nullptr;
+    float *d_reconstructed = nullptr;
+
+    void free_all() noexcept {
+        if (d_matrix) cudaFree(d_matrix);
+        if (d_u) cudaFree(d_u);
+        if (d_s) cudaFree(d_s);
+        if (d_v) cudaFree(d_v);
+        if (d_reconstructed) cudaFree(d_reconstructed);
+
+        d_matrix = nullptr;
+        d_u = nullptr;
+        d_s = nullptr;
+        d_v = nullptr;
+        d_reconstructed = nullptr;
+    }
+};
+
 struct BitsqzRuntimeConfig {
     bool initialized = false;
     bool svd_initialized = false;
@@ -34,10 +60,12 @@ struct BitsqzRuntimeConfig {
     float error_correction_topk_ratio = 0.0f;
     int svd_ranks = -1;
     int svd_niters = 1;
+    int svd_rank_capacity = 0;
     quantization_method_t svd_uv_format = quantization_INVALID;
     quantization_method_t svd_s_format = quantization_INVALID;
     quantization_method_t quantization_only_format = quantization_INVALID;
     ReconstructLowrankCUDAContext reconstruct_ctx{};
+    BitsqzCUDADeviceBuffers device_buffers{};
 };
 
 BitsqzRuntimeConfig g_bitsqz_runtime;
@@ -67,6 +95,41 @@ static bool ratio_is_valid(float ratio) {
 static bool quant_method_is_valid(quantization_method_t method) {
     if (method == quantization_INVALID) return true;
     return method >= Q8_0 && method <= Q2_K_FAST;
+}
+
+static void check_cuda(cudaError_t status, const char *msg) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
+    }
+}
+
+static void allocate_low_rank_device_buffers(
+    BitsqzCUDADeviceBuffers *buffers,
+    uint16_t rows,
+    uint16_t cols,
+    int rank,
+    bool allocate_input_matrix) {
+    if (!buffers) {
+        throw std::invalid_argument("buffers must not be null");
+    }
+    if (rows == 0 || cols == 0 || rank <= 0) {
+        throw std::invalid_argument("rows, cols, and rank must be positive");
+    }
+
+    const std::size_t matrix_count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t u_count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(rank);
+    const std::size_t s_count = static_cast<std::size_t>(rank);
+    const std::size_t v_count = static_cast<std::size_t>(cols) * static_cast<std::size_t>(rank);
+
+    buffers->free_all();
+
+    if (allocate_input_matrix) {
+        check_cuda(cudaMalloc(&buffers->d_matrix, matrix_count * sizeof(float)), "cudaMalloc d_matrix failed");
+    }
+    check_cuda(cudaMalloc(&buffers->d_u, u_count * sizeof(float)), "cudaMalloc d_u failed");
+    check_cuda(cudaMalloc(&buffers->d_s, s_count * sizeof(float)), "cudaMalloc d_s failed");
+    check_cuda(cudaMalloc(&buffers->d_v, v_count * sizeof(float)), "cudaMalloc d_v failed");
+    check_cuda(cudaMalloc(&buffers->d_reconstructed, matrix_count * sizeof(float)), "cudaMalloc d_reconstructed failed");
 }
 
 static uint64_t push_blob(std::vector<uint8_t> *payload, const void *src, uint64_t size) {
@@ -127,8 +190,74 @@ static int validate_section_bounds(const bitsqz_section_t &section, uint64_t pay
     return 0;
 }
 
+static int upload_low_rank_factors_to_device(
+    float *d_u,
+    float *d_s,
+    float *d_v,
+    cudaStream_t stream,
+    int padded_rank,
+    const std::vector<float> &U,
+    const std::vector<float> &S,
+    const std::vector<float> &V,
+    uint16_t rows,
+    uint16_t cols,
+    uint16_t rank) {
+    if (!d_u || !d_s || !d_v) return 1;
+    if (rank == 0 || padded_rank < static_cast<int>(rank)) return 1;
+    if (U.size() != static_cast<size_t>(rows) * rank) return 1;
+    if (S.size() != static_cast<size_t>(rank)) return 1;
+    if (V.size() != static_cast<size_t>(cols) * rank) return 1;
+
+    try {
+        const size_t rows_sz = static_cast<size_t>(rows);
+        const size_t cols_sz = static_cast<size_t>(cols);
+        const size_t rank_sz = static_cast<size_t>(rank);
+        const size_t padded_rank_sz = static_cast<size_t>(padded_rank);
+
+        const float *u_src = U.data();
+        const float *s_src = S.data();
+        const float *v_src = V.data();
+
+        std::vector<float> u_padded;
+        std::vector<float> s_padded;
+        std::vector<float> v_padded;
+
+        if (padded_rank != static_cast<int>(rank)) {
+            u_padded.assign(rows_sz * padded_rank_sz, 0.0f);
+            s_padded.assign(padded_rank_sz, 0.0f);
+            v_padded.assign(cols_sz * padded_rank_sz, 0.0f);
+
+            for (size_t r = 0; r < rows_sz; ++r) {
+                std::memcpy(u_padded.data() + r * padded_rank_sz, U.data() + r * rank_sz, rank_sz * sizeof(float));
+            }
+            std::memcpy(s_padded.data(), S.data(), rank_sz * sizeof(float));
+            for (size_t c = 0; c < cols_sz; ++c) {
+                std::memcpy(v_padded.data() + c * padded_rank_sz, V.data() + c * rank_sz, rank_sz * sizeof(float));
+            }
+
+            u_src = u_padded.data();
+            s_src = s_padded.data();
+            v_src = v_padded.data();
+        }
+
+        check_cuda(
+            cudaMemcpyAsync(d_u, u_src, rows_sz * padded_rank_sz * sizeof(float), cudaMemcpyHostToDevice, stream),
+            "cudaMemcpyAsync d_u failed");
+        check_cuda(
+            cudaMemcpyAsync(d_s, s_src, padded_rank_sz * sizeof(float), cudaMemcpyHostToDevice, stream),
+            "cudaMemcpyAsync d_s failed");
+        check_cuda(
+            cudaMemcpyAsync(d_v, v_src, cols_sz * padded_rank_sz * sizeof(float), cudaMemcpyHostToDevice, stream),
+            "cudaMemcpyAsync d_v failed");
+        return 0;
+    } catch (const std::exception &) {
+        return 1;
+    }
+}
+
 static int reconstruct_low_rank_cuda_with_context(
     ReconstructLowrankCUDAContext *ctx,
+    BitsqzCUDADeviceBuffers *buffers,
     const std::vector<float> &U,
     const std::vector<float> &S,
     const std::vector<float> &V,
@@ -136,40 +265,36 @@ static int reconstruct_low_rank_cuda_with_context(
     uint16_t cols,
     uint16_t rank,
     std::vector<float> *out) {
-    if (!ctx || !out) return 1;
+    if (!ctx || !buffers || !out) return 1;
     if (rank == 0) return 1;
     if (ctx->m != static_cast<int>(rows) || ctx->n != static_cast<int>(cols)) return 1;
-    if (U.size() != static_cast<size_t>(rows) * rank) return 1;
-    if (S.size() != static_cast<size_t>(rank)) return 1;
-    if (V.size() != static_cast<size_t>(cols) * rank) return 1;
+    if (ctx->k < static_cast<int>(rank)) return 1;
 
     try {
-        if (ctx->k == static_cast<int>(rank)) {
-            reconstruct_lowrank_cuda(ctx, U, S, V, out);
-            return 0;
-        }
-        if (ctx->k < static_cast<int>(rank)) {
+        if (upload_low_rank_factors_to_device(
+                buffers->d_u,
+                buffers->d_s,
+                buffers->d_v,
+                ctx->stream,
+                ctx->k,
+                U,
+                S,
+                V,
+                rows,
+                cols,
+                rank) != 0) {
             return 1;
         }
 
-        const size_t rows_sz = static_cast<size_t>(rows);
-        const size_t cols_sz = static_cast<size_t>(cols);
-        const size_t rank_sz = static_cast<size_t>(rank);
-        const size_t padded_rank_sz = static_cast<size_t>(ctx->k);
+        reconstruct_lowrank_cuda(ctx, buffers->d_u, buffers->d_s, buffers->d_v, buffers->d_reconstructed);
 
-        std::vector<float> U_padded(rows_sz * padded_rank_sz, 0.0f);
-        std::vector<float> S_padded(padded_rank_sz, 0.0f);
-        std::vector<float> V_padded(cols_sz * padded_rank_sz, 0.0f);
-
-        for (size_t r = 0; r < rows_sz; ++r) {
-            std::memcpy(U_padded.data() + r * padded_rank_sz, U.data() + r * rank_sz, rank_sz * sizeof(float));
-        }
-        std::memcpy(S_padded.data(), S.data(), rank_sz * sizeof(float));
-        for (size_t c = 0; c < cols_sz; ++c) {
-            std::memcpy(V_padded.data() + c * padded_rank_sz, V.data() + c * rank_sz, rank_sz * sizeof(float));
-        }
-
-        reconstruct_lowrank_cuda(ctx, U_padded, S_padded, V_padded, out);
+        out->resize(static_cast<size_t>(rows) * cols);
+        check_cuda(
+            cudaMemcpy(out->data(),
+                       buffers->d_reconstructed,
+                       static_cast<size_t>(rows) * cols * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "cudaMemcpy reconstructed matrix failed");
         return 0;
     } catch (const std::exception &) {
         return 1;
@@ -205,6 +330,7 @@ int bitsqz_llm_initialize(
     g_bitsqz_runtime.error_correction_topk_ratio = error_correction_topk_ratio;
     g_bitsqz_runtime.svd_ranks = svd_ranks;
     g_bitsqz_runtime.svd_niters = svd_niters;
+    g_bitsqz_runtime.svd_rank_capacity = 0;
     g_bitsqz_runtime.svd_uv_format = svd_uv_format;
     g_bitsqz_runtime.svd_s_format = svd_s_format;
     g_bitsqz_runtime.quantization_only_format = quantization_only_format;
@@ -227,6 +353,13 @@ int bitsqz_llm_initialize(
                 q,
                 1234ULL);
             g_bitsqz_runtime.reconstruct_initialized = true;
+            allocate_low_rank_device_buffers(
+                &g_bitsqz_runtime.device_buffers,
+                num_rows,
+                num_columns,
+                q,
+                true);
+            g_bitsqz_runtime.svd_rank_capacity = q;
         } catch (const std::exception &) {
             bitsqz_llm_release();
             return 1;
@@ -238,6 +371,7 @@ int bitsqz_llm_initialize(
 }
 
 void bitsqz_llm_release() {
+    g_bitsqz_runtime.device_buffers.free_all();
     if (g_bitsqz_runtime.svd_initialized) {
         svd_lowrank_cuda_release();
     }
@@ -317,16 +451,48 @@ int bitsqz_llm_compress(
 
         try {
             const auto step_begin = Clock::now();
-            const SVDLowrankCPUResult &svd = svd_lowrank_cuda(residual.data(), 1241ULL);
+            if (cfg.svd_rank_capacity != expected_q) return 1;
+            u_fp32.resize(static_cast<size_t>(num_rows) * static_cast<size_t>(expected_q));
+            s_fp32.resize(static_cast<size_t>(expected_q));
+            v_fp32.resize(static_cast<size_t>(num_columns) * static_cast<size_t>(expected_q));
+
+            check_cuda(
+                cudaMemcpy(
+                    cfg.device_buffers.d_matrix,
+                    residual.data(),
+                    static_cast<size_t>(num_elements) * sizeof(float),
+                    cudaMemcpyHostToDevice),
+                "cudaMemcpy residual to d_matrix failed");
+            svd_lowrank_cuda(
+                cfg.device_buffers.d_matrix,
+                cfg.device_buffers.d_u,
+                cfg.device_buffers.d_s,
+                cfg.device_buffers.d_v,
+                1241ULL);
+            check_cuda(
+                cudaMemcpy(
+                    u_fp32.data(),
+                    cfg.device_buffers.d_u,
+                    u_fp32.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_u to host failed");
+            check_cuda(
+                cudaMemcpy(
+                    s_fp32.data(),
+                    cfg.device_buffers.d_s,
+                    s_fp32.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_s to host failed");
+            check_cuda(
+                cudaMemcpy(
+                    v_fp32.data(),
+                    cfg.device_buffers.d_v,
+                    v_fp32.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_v to host failed");
             svd_lowrank_cuda_latency_ms += elapsed_ms(step_begin, Clock::now());
 
-            if (svd.k <= 0) return 1;
-            if (svd.k > expected_q) return 1;
-            effective_rank = static_cast<uint16_t>(svd.k);
-
-            u_fp32 = svd.U_row_major;
-            s_fp32 = svd.S;
-            v_fp32 = svd.V_row_major;
+            effective_rank = static_cast<uint16_t>(expected_q);
         } catch (const std::exception &) {
             return 1;
         }
@@ -389,6 +555,7 @@ int bitsqz_llm_compress(
         const auto step_begin = Clock::now();
         if (reconstruct_low_rank_cuda_with_context(
                 &g_bitsqz_runtime.reconstruct_ctx,
+                &g_bitsqz_runtime.device_buffers,
                 u_fp32,
                 s_fp32,
                 v_fp32,
@@ -556,6 +723,7 @@ int bitsqz_llm_compress(
 }
 
 int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *dst, uint32_t dst_num_elements) {
+    if (!g_bitsqz_runtime.initialized) return 1;
     if (!compressed || !dst || !compressed->payload) return 1;
     if (dst_num_elements < compressed->num_elements) return 1;
 
@@ -564,6 +732,12 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *dst, uint
     if ((compressed->flags & BITSQZ_FLAG_HAS_SVD) != 0) {
         const uint16_t rank = static_cast<uint16_t>(compressed->effective_rank);
         if (rank == 0) return 1;
+        if (!g_bitsqz_runtime.reconstruct_initialized) return 1;
+        if (g_bitsqz_runtime.num_rows != compressed->num_rows ||
+            g_bitsqz_runtime.num_columns != compressed->num_columns ||
+            g_bitsqz_runtime.svd_rank_capacity != static_cast<int>(rank)) {
+            return 1;
+        }
 
         std::vector<float> U;
         std::vector<float> S;
@@ -577,20 +751,16 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *dst, uint
             return 1;
         }
 
-        ReconstructLowrankCUDAContext reconstruct_ctx;
-        try {
-            reconstruct_lowrank_cuda_initialize(
-                &reconstruct_ctx,
-                static_cast<int>(compressed->num_rows),
-                static_cast<int>(compressed->num_columns),
-                static_cast<int>(rank),
-                1234ULL);
-        } catch (const std::exception &) {
-            return 1;
-        }
         const int rc = reconstruct_low_rank_cuda_with_context(
-            &reconstruct_ctx, U, S, V, compressed->num_rows, compressed->num_columns, rank, &restored);
-        reconstruct_lowrank_cuda_release(&reconstruct_ctx);
+            &g_bitsqz_runtime.reconstruct_ctx,
+            &g_bitsqz_runtime.device_buffers,
+            U,
+            S,
+            V,
+            compressed->num_rows,
+            compressed->num_columns,
+            rank,
+            &restored);
         if (rc != 0) return 1;
     } else {
         if (decode_section_to_fp32(compressed, compressed->section_direct, compressed->num_elements, &restored) != 0) {

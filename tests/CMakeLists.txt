@@ -8,6 +8,7 @@ target_sources(svd_lowrank_cuda_tests
 target_link_libraries(svd_lowrank_cuda_tests
     PRIVATE
         svd_lowrank_cuda_lib
+        CUDA::cudart
 )
 
 function(add_reconstruct_lowrank_cuda_test target_name source_file)
@@ -19,6 +20,7 @@ function(add_reconstruct_lowrank_cuda_test target_name source_file)
     target_link_libraries(${target_name}
         PRIVATE
             reconstruct_lowrank_cuda_lib
+            CUDA::cudart
     )
 endfunction()
 
