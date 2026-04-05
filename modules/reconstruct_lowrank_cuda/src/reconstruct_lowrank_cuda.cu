@@ -8,6 +8,9 @@
 
 namespace {
 
+using reconstruct_lowrank_cuda_detail::check_cublas;
+using reconstruct_lowrank_cuda_detail::check_cuda;
+
 void run_reconstruct_lowrank_cuda(ReconstructLowrankCUDAContext* ctx) {
     const float alpha = 1.0f;
     const float beta = 0.0f;

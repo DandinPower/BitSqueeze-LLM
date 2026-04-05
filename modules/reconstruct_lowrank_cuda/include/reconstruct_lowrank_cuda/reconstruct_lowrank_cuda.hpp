@@ -60,6 +60,8 @@ struct ReconstructLowrankCUDAContext {
     }
 };
 
+namespace reconstruct_lowrank_cuda_detail {
+
 inline void check_cuda(cudaError_t status, const char* msg) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
@@ -71,6 +73,8 @@ inline void check_cublas(cublasStatus_t status, const char* msg) {
         throw std::runtime_error(std::string(msg) + ": cublas error code " + std::to_string(status));
     }
 }
+
+} // namespace reconstruct_lowrank_cuda_detail
 
 void reconstruct_lowrank_cuda_release(ReconstructLowrankCUDAContext* ctx) noexcept;
 

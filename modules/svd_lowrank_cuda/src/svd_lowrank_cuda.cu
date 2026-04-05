@@ -1,92 +1,19 @@
 #include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <curand.h>
-#include <cusolverDn.h>
-
 namespace {
 
-inline void check_cuda(cudaError_t status, const char* msg) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(status));
-    }
-}
-
-inline void check_cublas(cublasStatus_t status, const char* msg) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(msg) + ": cublas error code " + std::to_string(status));
-    }
-}
-
-inline void check_curand(curandStatus_t status, const char* msg) {
-    if (status != CURAND_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(msg) + ": curand error code " + std::to_string(status));
-    }
-}
-
-inline void check_cusolver(cusolverStatus_t status, const char* msg) {
-    if (status != CUSOLVER_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(msg) + ": cusolver error code " + std::to_string(status));
-    }
-}
-
-inline void col_major_to_row_major(const float* src, int rows, int cols, float* dst) {
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            dst[static_cast<std::size_t>(r) * cols + c] = src[static_cast<std::size_t>(c) * rows + r];
-        }
-    }
-}
-
-struct DevicePtrs {
-    float *d_A_row_major = nullptr, *d_A = nullptr, *d_R = nullptr, *d_X = nullptr, *d_Q = nullptr;
-    float *d_X_temp = nullptr, *d_Q_temp = nullptr, *d_tau_M = nullptr, *d_tau_N = nullptr;
-    float *d_work = nullptr, *d_B = nullptr, *d_U_hat = nullptr, *d_S = nullptr, *d_V_hat = nullptr;
-    float *d_U_work = nullptr;
-    int* d_devInfo = nullptr;
-
-    void free_all() noexcept {
-        cudaFree(d_A_row_major);
-        cudaFree(d_A);
-        cudaFree(d_R);
-        cudaFree(d_X);
-        cudaFree(d_Q);
-        cudaFree(d_X_temp);
-        cudaFree(d_Q_temp);
-        cudaFree(d_tau_M);
-        cudaFree(d_tau_N);
-        cudaFree(d_work);
-        cudaFree(d_B);
-        cudaFree(d_U_hat);
-        cudaFree(d_S);
-        cudaFree(d_V_hat);
-        cudaFree(d_U_work);
-        cudaFree(d_devInfo);
-
-        d_A_row_major = nullptr;
-        d_A = nullptr;
-        d_R = nullptr;
-        d_X = nullptr;
-        d_Q = nullptr;
-        d_X_temp = nullptr;
-        d_Q_temp = nullptr;
-        d_tau_M = nullptr;
-        d_tau_N = nullptr;
-        d_work = nullptr;
-        d_B = nullptr;
-        d_U_hat = nullptr;
-        d_S = nullptr;
-        d_V_hat = nullptr;
-        d_U_work = nullptr;
-        d_devInfo = nullptr;
-    }
-};
+using svd_lowrank_cuda_detail::check_cublas;
+using svd_lowrank_cuda_detail::check_cuda;
+using svd_lowrank_cuda_detail::check_curand;
+using svd_lowrank_cuda_detail::check_cusolver;
+using svd_lowrank_cuda_detail::col_major_to_row_major;
 
 __global__ void transpose_row_to_col_kernel(const float* src_row_major, float* dst_col_major, int m, int n) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -95,83 +22,6 @@ __global__ void transpose_row_to_col_kernel(const float* src_row_major, float* d
         dst_col_major[static_cast<std::size_t>(c) * m + r] = src_row_major[static_cast<std::size_t>(r) * n + c];
     }
 }
-
-struct SVDLowrankCUDAContext {
-    int m = 0;
-    int n = 0;
-    int k = 0;
-    int M_work = 0;
-    int N_work = 0;
-    int lwork = 0;
-    int niter = 0;
-    bool is_transposed = false;
-    bool initialized = false;
-
-    cudaStream_t stream = nullptr;
-    cudaGraph_t lowrank_graph = nullptr;
-    cudaGraphExec_t lowrank_graph_exec = nullptr;
-    int graph_niter = -1;
-
-    cublasHandle_t cublasH = nullptr;
-    cusolverDnHandle_t cusolverH = nullptr;
-    curandGenerator_t curandGen = nullptr;
-    gesvdjInfo_t svdj_params = nullptr;
-    DevicePtrs d;
-
-    std::vector<float> h_U_work_col_major;
-    std::vector<float> h_V_hat_col_major;
-    SVDLowrankCPUResult host_result;
-
-    void destroy_graph() noexcept {
-        if (lowrank_graph_exec) {
-            cudaGraphExecDestroy(lowrank_graph_exec);
-            lowrank_graph_exec = nullptr;
-        }
-        if (lowrank_graph) {
-            cudaGraphDestroy(lowrank_graph);
-            lowrank_graph = nullptr;
-        }
-        graph_niter = -1;
-    }
-
-    void destroy_all() noexcept {
-        destroy_graph();
-        d.free_all();
-        if (stream) {
-            cudaStreamDestroy(stream);
-            stream = nullptr;
-        }
-        if (svdj_params) {
-            cusolverDnDestroyGesvdjInfo(svdj_params);
-            svdj_params = nullptr;
-        }
-        if (curandGen) {
-            curandDestroyGenerator(curandGen);
-            curandGen = nullptr;
-        }
-        if (cusolverH) {
-            cusolverDnDestroy(cusolverH);
-            cusolverH = nullptr;
-        }
-        if (cublasH) {
-            cublasDestroy(cublasH);
-            cublasH = nullptr;
-        }
-
-        m = 0;
-        n = 0;
-        k = 0;
-        M_work = 0;
-        N_work = 0;
-        lwork = 0;
-        niter = 0;
-        is_transposed = false;
-        h_U_work_col_major.clear();
-        h_V_hat_col_major.clear();
-        host_result = SVDLowrankCPUResult{};
-        initialized = false;
-    }
-};
 
 SVDLowrankCUDAContext g_ctx;
 
@@ -234,7 +84,7 @@ void set_rng_seed(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
     check_curand(curandSetPseudoRandomGeneratorSeed(ctx->curandGen, seed), "curandSetPseudoRandomGeneratorSeed failed");
 }
 
-void run_lowrank_compute_body(SVDLowrankCUDAContext* ctx, int niter) {
+void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
     const int iters = std::max(0, niter);
     const cublasOperation_t op_A = ctx->is_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t op_A_H = ctx->is_transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -320,6 +170,12 @@ void run_lowrank_compute_body(SVDLowrankCUDAContext* ctx, int niter) {
     check_cublas(cublasSgemm(ctx->cublasH, CUBLAS_OP_T, op_A, ctx->k, ctx->N_work, ctx->M_work, &alpha, ctx->d.d_Q, ctx->M_work,
                              ctx->d.d_A, ctx->m, &beta, ctx->d.d_B, ctx->k),
                  "Projection gemm Q^T A failed");
+}
+
+void run_lowrank_postsvd_body(SVDLowrankCUDAContext* ctx) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
     check_cusolver(cusolverDnSgesvdj(
                        ctx->cusolverH,
                        CUSOLVER_EIG_MODE_VECTOR,
@@ -343,7 +199,19 @@ void run_lowrank_compute_body(SVDLowrankCUDAContext* ctx, int niter) {
                  "Recover U_work gemm failed");
 }
 
-void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
+void run_lowrank_compute_body(SVDLowrankCUDAContext* ctx, int niter) {
+    run_lowrank_presvd_body(ctx, niter);
+    run_lowrank_postsvd_body(ctx);
+}
+
+[[noreturn]] void abort_with_message(const std::string& message) {
+    std::fprintf(stderr, "Fatal error: %s\n", message.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+template <typename BodyFn>
+void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter, BodyFn&& body) {
     ctx->destroy_graph();
 
     cudaGraph_t captured_graph = nullptr;
@@ -356,7 +224,7 @@ void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
 
     std::string body_error;
     try {
-        run_lowrank_compute_body(ctx, niter);
+        body();
     } catch (const std::exception& e) {
         body_error = e.what();
     } catch (...) {
@@ -369,7 +237,7 @@ void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
             cudaGraphDestroy(captured_graph);
         }
         (void) cudaGetLastError();
-        throw std::runtime_error("lowrank graph capture body failed: " + body_error);
+        throw std::runtime_error(std::string("lowrank pre-SVD graph capture body failed: ") + body_error);
     }
     if (end_status != cudaSuccess || captured_graph == nullptr) {
         if (captured_graph) {
@@ -377,7 +245,7 @@ void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
         }
         (void) cudaGetLastError();
         throw std::runtime_error(
-            std::string("cudaStreamEndCapture for lowrank graph failed: ") + cudaGetErrorString(end_status));
+            std::string("cudaStreamEndCapture for lowrank pre-SVD graph failed: ") + cudaGetErrorString(end_status));
     }
 
     cudaGraphExec_t graph_exec = nullptr;
@@ -386,7 +254,7 @@ void capture_lowrank_graph_or_throw(SVDLowrankCUDAContext* ctx, int niter) {
         cudaGraphDestroy(captured_graph);
         (void) cudaGetLastError();
         throw std::runtime_error(
-            std::string("cudaGraphInstantiate for lowrank graph failed: ") + cudaGetErrorString(inst_status));
+            std::string("cudaGraphInstantiate for lowrank pre-SVD graph failed: ") + cudaGetErrorString(inst_status));
     }
 
     ctx->lowrank_graph = captured_graph;
@@ -403,6 +271,7 @@ void run_lowrank_compute(SVDLowrankCUDAContext* ctx, unsigned long long seed) {
         throw std::logic_error("lowrank CUDA graph niter mismatch; recapture is required before execution");
     }
     check_cuda(cudaGraphLaunch(ctx->lowrank_graph_exec, ctx->stream), "cudaGraphLaunch lowrank graph failed");
+    run_lowrank_postsvd_body(ctx);
 }
 
 void copy_result_to_host(SVDLowrankCUDAContext* ctx) {
@@ -525,9 +394,17 @@ void svd_lowrank_cuda_initialize(int m, int n, int q, int niter, unsigned long l
         run_lowrank_compute_body(&g_ctx, g_ctx.niter);
         check_cuda(cudaStreamSynchronize(g_ctx.stream), "cudaStreamSynchronize after warmup failed");
 
-        // Capture once during initialization; this module requires graph replay for execution.
+        // Capture only the pre-SVD prefix. cusolverDnSgesvdj is not CUDA graph compatible.
         set_rng_seed(&g_ctx, warmup_seed);
-        capture_lowrank_graph_or_throw(&g_ctx, g_ctx.niter);
+        try {
+            capture_lowrank_graph_or_throw(
+                &g_ctx,
+                g_ctx.niter,
+                [&]() { run_lowrank_presvd_body(&g_ctx, g_ctx.niter); });
+        } catch (const std::exception& presvd_capture_error) {
+            abort_with_message(
+                std::string("mandatory pre-SVD lowrank graph capture failed: ") + presvd_capture_error.what());
+        }
 
         g_ctx.initialized = true;
     } catch (...) {
