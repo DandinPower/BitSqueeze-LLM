@@ -80,12 +80,12 @@ int main() {
         check_cuda(cudaMalloc(&buffers.d_S, static_cast<std::size_t>(kQ) * sizeof(float)), "cudaMalloc d_S failed");
         check_cuda(cudaMalloc(&buffers.d_V, static_cast<std::size_t>(kN) * kQ * sizeof(float)), "cudaMalloc d_V failed");
         check_cuda(
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 buffers.d_A,
                 A.data(),
                 static_cast<std::size_t>(kM) * kN * sizeof(float),
                 cudaMemcpyHostToDevice),
-            "cudaMemcpy A H2D failed");
+            "cudaMemcpyAsync A H2D failed");
 
         std::cout << "svd_lowrank_cuda nsys profile case" << '\n';
         std::cout << "m=" << kM << ", n=" << kN << ", q=" << kQ << ", niter=" << kNiter << '\n';

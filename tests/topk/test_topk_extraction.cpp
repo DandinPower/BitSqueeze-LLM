@@ -88,24 +88,24 @@ int main(void) {
         check_cuda(cudaMalloc(&buffers.d_roundtrip_indices, topk_elements * sizeof(uint16_t)), "cudaMalloc d_roundtrip_indices failed");
         check_cuda(cudaMalloc(&buffers.d_roundtrip_values, topk_elements * sizeof(float)), "cudaMalloc d_roundtrip_values failed");
 
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_input,
                        input.data(),
                        input.size() * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy input H2D failed");
+                   "cudaMemcpyAsync input H2D failed");
 
         topk_array_t topk_array{};
         topk_bind_array(&topk_array, rows, cols, k, buffers.d_topk_indices, buffers.d_topk_values);
         topk_extraction(&ctx, buffers.d_input, &topk_array);
 
         std::vector<float> input_after(input.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        input_after.data(),
                        buffers.d_input,
                        input_after.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy input D2H failed");
+                   "cudaMemcpyAsync input D2H failed");
         for (size_t i = 0; i < input_after.size(); ++i) {
             if (!almost_equal(input_after[i], original[i])) {
                 std::fprintf(stderr, "input mutated by topk_extraction at %zu\n", i);
@@ -116,18 +116,18 @@ int main(void) {
 
         std::vector<uint16_t> topk_indices(topk_elements, 0);
         std::vector<float> topk_values(topk_elements, 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        topk_indices.data(),
                        buffers.d_topk_indices,
                        topk_indices.size() * sizeof(uint16_t),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy topk indices D2H failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync topk indices D2H failed");
+        check_cuda(cudaMemcpyAsync(
                        topk_values.data(),
                        buffers.d_topk_values,
                        topk_values.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy topk values D2H failed");
+                   "cudaMemcpyAsync topk values D2H failed");
 
         for (uint16_t r = 0; r < rows; ++r) {
             std::set<uint16_t> actual_indices;
@@ -163,12 +163,12 @@ int main(void) {
 
         topk_decompress(&ctx, &topk_array, buffers.d_decompressed);
         std::vector<float> decompressed(input.size(), -123.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        decompressed.data(),
                        buffers.d_decompressed,
                        decompressed.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy decompressed D2H failed");
+                   "cudaMemcpyAsync decompressed D2H failed");
 
         for (uint16_t r = 0; r < rows; ++r) {
             std::set<uint16_t> selected;
@@ -196,12 +196,12 @@ int main(void) {
         check_cuda(cudaMemset(buffers.d_zero_matrix, 0, input.size() * sizeof(float)), "cudaMemset d_zero_matrix failed");
         topk_apply(&ctx, &topk_array, buffers.d_zero_matrix);
         std::vector<float> zero_matrix(input.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        zero_matrix.data(),
                        buffers.d_zero_matrix,
                        zero_matrix.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy zero_matrix D2H failed");
+                   "cudaMemcpyAsync zero_matrix D2H failed");
 
         for (uint16_t r = 0; r < rows; ++r) {
             std::set<uint16_t> selected;
@@ -242,12 +242,12 @@ int main(void) {
 
         topk_decompress(&ctx, &roundtrip_array, buffers.d_decompressed);
         std::vector<float> roundtrip_decompressed(input.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        roundtrip_decompressed.data(),
                        buffers.d_decompressed,
                        roundtrip_decompressed.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy roundtrip D2H failed");
+                   "cudaMemcpyAsync roundtrip D2H failed");
         for (size_t i = 0; i < decompressed.size(); ++i) {
             if (!almost_equal(roundtrip_decompressed[i], decompressed[i])) {
                 std::fprintf(stderr, "roundtrip decompress mismatch at %zu\n", i);

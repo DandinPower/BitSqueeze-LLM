@@ -142,18 +142,18 @@ void topk_initialize(
             segment_offsets_end[row] = begin + static_cast<int>(num_columns);
         }
 
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        ctx->cuda_ptrs.d_segment_offsets_begin,
                        segment_offsets_begin.data(),
                        segment_offsets_begin.size() * sizeof(int),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy segment_offsets_begin failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync segment_offsets_begin failed");
+        check_cuda(cudaMemcpyAsync(
                        ctx->cuda_ptrs.d_segment_offsets_end,
                        segment_offsets_end.data(),
                        segment_offsets_end.size() * sizeof(int),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy segment_offsets_end failed");
+                   "cudaMemcpyAsync segment_offsets_end failed");
 
         check_cuda(
             cub::DeviceSegmentedRadixSort::SortPairsDescending(
@@ -311,18 +311,18 @@ int topk_pack_to_buffer(
 
         uint8_t *indices_dst = bytes + sizeof(header);
         uint8_t *values_dst = indices_dst + topk_elements * sizeof(uint16_t);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        indices_dst,
                        topk_array->d_topk_indices,
                        topk_elements * sizeof(uint16_t),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy topk indices D2H failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync topk indices D2H failed");
+        check_cuda(cudaMemcpyAsync(
                        values_dst,
                        topk_array->d_values,
                        topk_elements * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy topk values D2H failed");
+                   "cudaMemcpyAsync topk values D2H failed");
         return 0;
     } catch (const std::exception &) {
         return 1;
@@ -360,18 +360,18 @@ int topk_unpack_from_buffer(
         const uint8_t *indices_src = bytes + sizeof(header);
         const uint8_t *values_src = indices_src + topk_elements * sizeof(uint16_t);
         if (topk_elements > 0) {
-            check_cuda(cudaMemcpy(
+            check_cuda(cudaMemcpyAsync(
                            topk_array->d_topk_indices,
                            indices_src,
                            topk_elements * sizeof(uint16_t),
                            cudaMemcpyHostToDevice),
-                       "cudaMemcpy topk indices H2D failed");
-            check_cuda(cudaMemcpy(
+                       "cudaMemcpyAsync topk indices H2D failed");
+            check_cuda(cudaMemcpyAsync(
                            topk_array->d_values,
                            values_src,
                            topk_elements * sizeof(float),
                            cudaMemcpyHostToDevice),
-                       "cudaMemcpy topk values H2D failed");
+                       "cudaMemcpyAsync topk values H2D failed");
             check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after topk unpack failed");
         }
 

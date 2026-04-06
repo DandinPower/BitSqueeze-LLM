@@ -85,24 +85,24 @@ int main() {
         check_cuda(cudaMalloc(&buffers.d_S, static_cast<std::size_t>(kK) * sizeof(float)), "cudaMalloc d_S failed");
         check_cuda(cudaMalloc(&buffers.d_V, static_cast<std::size_t>(kN) * kK * sizeof(float)), "cudaMalloc d_V failed");
         check_cuda(cudaMalloc(&buffers.d_out, static_cast<std::size_t>(kM) * kN * sizeof(float)), "cudaMalloc d_out failed");
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_U,
                        U.data(),
                        static_cast<std::size_t>(kM) * kK * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy U H2D failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync U H2D failed");
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_S,
                        S.data(),
                        static_cast<std::size_t>(kK) * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy S H2D failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync S H2D failed");
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_V,
                        V.data(),
                        static_cast<std::size_t>(kN) * kK * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy V H2D failed");
+                   "cudaMemcpyAsync V H2D failed");
 
         std::vector<float> out(static_cast<std::size_t>(kM) * kN, 0.0f);
         for (int i = 0; i < kWarmupIters; ++i) {
@@ -117,12 +117,12 @@ int main() {
             const auto end = std::chrono::high_resolution_clock::now();
             latencies_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
         }
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        out.data(),
                        buffers.d_out,
                        out.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy out D2H failed");
+                   "cudaMemcpyAsync out D2H failed");
 
         if (out.size() != static_cast<std::size_t>(kM) * kN) {
             throw std::runtime_error("output size mismatch");
@@ -131,24 +131,24 @@ int main() {
         std::vector<float> U_after(U.size(), 0.0f);
         std::vector<float> S_after(S.size(), 0.0f);
         std::vector<float> V_after(V.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        U_after.data(),
                        buffers.d_U,
                        U_after.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy U D2H failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync U D2H failed");
+        check_cuda(cudaMemcpyAsync(
                        S_after.data(),
                        buffers.d_S,
                        S_after.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy S D2H failed");
-        check_cuda(cudaMemcpy(
+                   "cudaMemcpyAsync S D2H failed");
+        check_cuda(cudaMemcpyAsync(
                        V_after.data(),
                        buffers.d_V,
                        V_after.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy V D2H failed");
+                   "cudaMemcpyAsync V D2H failed");
 
         double max_input_drift = 0.0;
         for (std::size_t i = 0; i < U.size(); ++i) {

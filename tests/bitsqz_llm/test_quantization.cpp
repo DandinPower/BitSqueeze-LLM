@@ -64,12 +64,12 @@ int run_case(const char *name,
     try {
         check_cuda(cudaMalloc(&buffers.d_source, source.size() * sizeof(float)), "cudaMalloc d_source failed");
         check_cuda(cudaMalloc(&buffers.d_restored, source.size() * sizeof(float)), "cudaMalloc d_restored failed");
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_source,
                        source.data(),
                        source.size() * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy source H2D failed");
+                   "cudaMemcpyAsync source H2D failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: device setup failed: %s\n", name, e.what());
         return 1;
@@ -128,12 +128,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        restored.data(),
                        buffers.d_restored,
                        restored.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy restored D2H failed");
+                   "cudaMemcpyAsync restored D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(compressed);
@@ -198,12 +198,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        restored_after_load.data(),
                        buffers.d_restored,
                        restored_after_load.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy restored_after_load D2H failed");
+                   "cudaMemcpyAsync restored_after_load D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: reload restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(loaded);

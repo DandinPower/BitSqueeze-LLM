@@ -144,12 +144,12 @@ int main() {
                 check_cuda(cudaMalloc(&buffers.d_U, static_cast<std::size_t>(m) * q * sizeof(float)), "cudaMalloc d_U failed");
                 check_cuda(cudaMalloc(&buffers.d_S, static_cast<std::size_t>(q) * sizeof(float)), "cudaMalloc d_S failed");
                 check_cuda(cudaMalloc(&buffers.d_V, static_cast<std::size_t>(n) * q * sizeof(float)), "cudaMalloc d_V failed");
-                check_cuda(cudaMemcpy(
+                check_cuda(cudaMemcpyAsync(
                                buffers.d_A,
                                A.data(),
                                static_cast<std::size_t>(m) * n * sizeof(float),
                                cudaMemcpyHostToDevice),
-                           "cudaMemcpy A H2D failed");
+                           "cudaMemcpyAsync A H2D failed");
 
                 svd_lowrank_cuda_initialize(m, n, q, niter, seed + 1ULL);
 
@@ -157,24 +157,24 @@ int main() {
                 svd_lowrank_cuda(buffers.d_A, buffers.d_U, buffers.d_S, buffers.d_V, seed + 7ULL);
                 const auto wall_end = std::chrono::high_resolution_clock::now();
                 const double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
-                check_cuda(cudaMemcpy(
+                check_cuda(cudaMemcpyAsync(
                                svd.U_row_major.data(),
                                buffers.d_U,
                                svd.U_row_major.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy U D2H failed");
-                check_cuda(cudaMemcpy(
+                           "cudaMemcpyAsync U D2H failed");
+                check_cuda(cudaMemcpyAsync(
                                svd.S.data(),
                                buffers.d_S,
                                svd.S.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy S D2H failed");
-                check_cuda(cudaMemcpy(
+                           "cudaMemcpyAsync S D2H failed");
+                check_cuda(cudaMemcpyAsync(
                                svd.V_row_major.data(),
                                buffers.d_V,
                                svd.V_row_major.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy V D2H failed");
+                           "cudaMemcpyAsync V D2H failed");
 
                 const auto A_hat = reconstruct_from_svd(svd);
                 double mae = 0.0;

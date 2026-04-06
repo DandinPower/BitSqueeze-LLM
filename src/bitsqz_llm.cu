@@ -321,12 +321,12 @@ static int copy_device_buffer_to_host(
 
     try {
         dst->resize(static_cast<size_t>(count));
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        dst->data(),
                        d_src,
                        static_cast<size_t>(count) * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy D2H failed");
+                   "cudaMemcpyAsync D2H failed");
         return 0;
     } catch (const std::exception &) {
         return 1;
@@ -476,8 +476,8 @@ static int device_buffer_has_nonzero(
         check_cuda(cudaGetLastError(), "has_nonzero kernel launch failed");
 
         int host_flag = 0;
-        check_cuda(cudaMemcpy(&host_flag, buffers->d_has_nonzero, sizeof(int), cudaMemcpyDeviceToHost),
-                   "cudaMemcpy d_has_nonzero failed");
+        check_cuda(cudaMemcpyAsync(&host_flag, buffers->d_has_nonzero, sizeof(int), cudaMemcpyDeviceToHost),
+                   "cudaMemcpyAsync d_has_nonzero failed");
         *out_has_nonzero = (host_flag != 0);
         return 0;
     } catch (const std::exception &) {
@@ -632,12 +632,12 @@ int bitsqz_llm_compress(
     uint16_t effective_rank = 0;
 
     try {
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        cfg.device_buffers.d_residual,
                        d_row_major_matrix_float_data,
                        matrix_bytes,
                        cudaMemcpyDeviceToDevice),
-                   "cudaMemcpy input D2D failed");
+                   "cudaMemcpyAsync input D2D failed");
         check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after residual copy failed");
 
         if (cfg.outlier_topk.initialized) {
@@ -673,24 +673,24 @@ int bitsqz_llm_compress(
                     cfg.device_buffers.d_v,
                     1241ULL);
 
-                check_cuda(cudaMemcpy(
+                check_cuda(cudaMemcpyAsync(
                                u_fp32.data(),
                                cfg.device_buffers.d_u,
                                u_fp32.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy d_u to host failed");
-                check_cuda(cudaMemcpy(
+                           "cudaMemcpyAsync d_u to host failed");
+                check_cuda(cudaMemcpyAsync(
                                s_fp32.data(),
                                cfg.device_buffers.d_s,
                                s_fp32.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy d_s to host failed");
-                check_cuda(cudaMemcpy(
+                           "cudaMemcpyAsync d_s to host failed");
+                check_cuda(cudaMemcpyAsync(
                                v_fp32.data(),
                                cfg.device_buffers.d_v,
                                v_fp32.size() * sizeof(float),
                                cudaMemcpyDeviceToHost),
-                           "cudaMemcpy d_v to host failed");
+                           "cudaMemcpyAsync d_v to host failed");
                 svd_lowrank_cuda_latency_ms += elapsed_ms(step_begin, Clock::now());
                 effective_rank = static_cast<uint16_t>(expected_q);
             } catch (const std::exception &) {
@@ -861,12 +861,12 @@ int bitsqz_llm_compress(
                     }
                     reconsturct_quantization_decompress_latency_ms += elapsed_ms(dq_begin, Clock::now());
 
-                    check_cuda(cudaMemcpy(
+                    check_cuda(cudaMemcpyAsync(
                                    cfg.device_buffers.d_reconstructed,
                                    deq.data(),
                                    matrix_bytes,
                                    cudaMemcpyHostToDevice),
-                               "cudaMemcpy dequantized direct matrix H2D failed");
+                               "cudaMemcpyAsync dequantized direct matrix H2D failed");
 
                     const auto error_begin = Clock::now();
                     if (compute_error_buffer(
@@ -1063,12 +1063,12 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *d_dst, ui
             if (decode_section_to_fp32(compressed, compressed->section_direct, compressed->num_elements, &restored) != 0) {
                 return 1;
             }
-            check_cuda(cudaMemcpy(
+            check_cuda(cudaMemcpyAsync(
                            d_dst,
                            restored.data(),
                            static_cast<size_t>(compressed->num_elements) * sizeof(float),
                            cudaMemcpyHostToDevice),
-                       "cudaMemcpy restored direct matrix H2D failed");
+                       "cudaMemcpyAsync restored direct matrix H2D failed");
             check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after direct restore copy failed");
         }
 

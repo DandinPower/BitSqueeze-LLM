@@ -52,33 +52,33 @@ int run_case(float ratio, uint16_t rows, uint16_t cols, const std::vector<float>
             check_cuda(cudaMalloc(&buffers.d_topk_values, topk_elements * sizeof(float)),
                        "cudaMalloc d_topk_values failed");
         }
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        buffers.d_residual,
                        source.data(),
                        source.size() * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpy residual H2D failed");
+                   "cudaMemcpyAsync residual H2D failed");
 
         topk_array_t topk_array{};
         topk_bind_array(&topk_array, rows, cols, k, buffers.d_topk_indices, buffers.d_topk_values);
         topk_separation(&ctx, buffers.d_residual, &topk_array);
 
         std::vector<float> residual(source.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        residual.data(),
                        buffers.d_residual,
                        residual.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy residual D2H failed");
+                   "cudaMemcpyAsync residual D2H failed");
 
         std::vector<uint16_t> topk_indices(topk_elements, 0);
         if (topk_elements > 0) {
-            check_cuda(cudaMemcpy(
+            check_cuda(cudaMemcpyAsync(
                            topk_indices.data(),
                            buffers.d_topk_indices,
                            topk_indices.size() * sizeof(uint16_t),
                            cudaMemcpyDeviceToHost),
-                       "cudaMemcpy topk indices D2H failed");
+                       "cudaMemcpyAsync topk indices D2H failed");
         }
 
         for (uint16_t r = 0; r < rows; ++r) {
@@ -110,12 +110,12 @@ int run_case(float ratio, uint16_t rows, uint16_t cols, const std::vector<float>
 
         topk_apply(&ctx, &topk_array, buffers.d_residual);
         std::vector<float> restored(source.size(), 0.0f);
-        check_cuda(cudaMemcpy(
+        check_cuda(cudaMemcpyAsync(
                        restored.data(),
                        buffers.d_residual,
                        restored.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpy restored D2H failed");
+                   "cudaMemcpyAsync restored D2H failed");
 
         for (size_t i = 0; i < source.size(); ++i) {
             if (!almost_equal(restored[i], source[i])) {

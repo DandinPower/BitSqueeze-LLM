@@ -67,8 +67,8 @@ int main(void) {
         check_cuda(cudaMalloc(&buffers.d_values, topk_elements * sizeof(float)), "cudaMalloc d_values failed");
         check_cuda(cudaMalloc(&buffers.d_indices_unpacked, topk_elements * sizeof(uint16_t)), "cudaMalloc d_indices_unpacked failed");
         check_cuda(cudaMalloc(&buffers.d_values_unpacked, topk_elements * sizeof(float)), "cudaMalloc d_values_unpacked failed");
-        check_cuda(cudaMemcpy(buffers.d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice),
-                   "cudaMemcpy input H2D failed");
+        check_cuda(cudaMemcpyAsync(buffers.d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice),
+                   "cudaMemcpyAsync input H2D failed");
 
         topk_array_t topk_array{};
         topk_bind_array(&topk_array, rows, cols, k, buffers.d_indices, buffers.d_values);
@@ -103,8 +103,8 @@ int main(void) {
 
         topk_decompress(&ctx, &unpacked, buffers.d_dense);
         std::vector<float> dense(input.size(), 0.0f);
-        check_cuda(cudaMemcpy(dense.data(), buffers.d_dense, dense.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "cudaMemcpy dense D2H failed");
+        check_cuda(cudaMemcpyAsync(dense.data(), buffers.d_dense, dense.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "cudaMemcpyAsync dense D2H failed");
 
         for (uint16_t r = 0; r < rows; ++r) {
             int nonzero_count = 0;
