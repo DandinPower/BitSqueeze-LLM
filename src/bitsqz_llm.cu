@@ -588,6 +588,158 @@ static int decode_section_to_device(
     return 1;
 }
 
+static bool section_has_storage(const bitsqz_section_t &section) {
+    return section.storage != BITSQZ_SECTION_NONE;
+}
+
+static bool section_uses_quantization(const bitsqz_section_t &section) {
+    return section.storage == BITSQZ_SECTION_QUANT;
+}
+
+static int validate_section_method_pair(
+    const bitsqz_section_t &section,
+    quantization_method_t method) {
+    if (section.storage == BITSQZ_SECTION_NONE) {
+        return 0;
+    }
+    if (section.storage == BITSQZ_SECTION_FP32) {
+        return method == quantization_INVALID ? 0 : 1;
+    }
+    if (section.storage == BITSQZ_SECTION_QUANT) {
+        return method != quantization_INVALID && quant_method_is_valid(method) ? 0 : 1;
+    }
+    return 1;
+}
+
+static int validate_topk_runtime_compatibility(
+    const BitsqzTopkRuntime &runtime,
+    const bitsqz_llm_array_t *compressed,
+    const bitsqz_section_t &section) {
+    if (!runtime.initialized || compressed == nullptr || compressed->payload == nullptr) {
+        return 1;
+    }
+
+    topk_packed_header_t header{};
+    const auto *payload = static_cast<const uint8_t *>(compressed->payload);
+    if (topk_validate_packed_buffer(payload + section.offset, section.size, &header) != 0) {
+        return 1;
+    }
+    if (header.num_rows != compressed->num_rows || header.num_columns != compressed->num_columns) {
+        return 1;
+    }
+    if (header.num_topk_columns > runtime.capacity_topk_columns) {
+        return 1;
+    }
+    return 0;
+}
+
+static int validate_decompress_compatibility(
+    const BitsqzRuntimeConfig *cfg,
+    const bitsqz_llm_array_t *compressed) {
+    if (cfg == nullptr || compressed == nullptr || compressed->payload == nullptr) {
+        return 1;
+    }
+    if (compressed->num_rows == 0 || compressed->num_columns == 0 || compressed->num_elements == 0) {
+        return 1;
+    }
+    if (cfg->num_rows != compressed->num_rows || cfg->num_columns != compressed->num_columns) {
+        return 1;
+    }
+
+    const uint32_t expected_num_elements =
+        static_cast<uint32_t>(compressed->num_rows) * static_cast<uint32_t>(compressed->num_columns);
+    if (compressed->num_elements != expected_num_elements) {
+        return 1;
+    }
+
+    const uint64_t packed_size = bitsqz_llm_get_packed_size(compressed);
+    if (packed_size < sizeof(bitsqz_llm_array_t)) {
+        return 1;
+    }
+    const uint64_t payload_size = packed_size - sizeof(bitsqz_llm_array_t);
+    const bitsqz_section_t sections[] = {
+        compressed->section_u,
+        compressed->section_s,
+        compressed->section_v,
+        compressed->section_direct,
+        compressed->section_outlier_topk,
+        compressed->section_error_topk,
+    };
+    for (const bitsqz_section_t &section : sections) {
+        if (validate_section_bounds(section, payload_size) != 0) {
+            return 1;
+        }
+    }
+
+    const bool has_svd = (compressed->flags & BITSQZ_FLAG_HAS_SVD) != 0;
+    const bool has_outlier_topk = (compressed->flags & BITSQZ_FLAG_HAS_OUTLIER_TOPK) != 0;
+    const bool has_error_topk = (compressed->flags & BITSQZ_FLAG_HAS_ERROR_TOPK) != 0;
+
+    if (validate_section_method_pair(compressed->section_u, compressed->svd_uv_format) != 0 ||
+        validate_section_method_pair(compressed->section_s, compressed->svd_s_format) != 0 ||
+        validate_section_method_pair(compressed->section_v, compressed->svd_uv_format) != 0 ||
+        validate_section_method_pair(compressed->section_direct, compressed->quantization_only_format) != 0) {
+        return 1;
+    }
+
+    if (has_svd) {
+        const uint16_t rank = static_cast<uint16_t>(compressed->effective_rank);
+        if (rank == 0) {
+            return 1;
+        }
+        if (!cfg->reconstruct_initialized || cfg->svd_rank_capacity < static_cast<int>(rank)) {
+            return 1;
+        }
+        if (!section_has_storage(compressed->section_u) ||
+            !section_has_storage(compressed->section_s) ||
+            !section_has_storage(compressed->section_v) ||
+            section_has_storage(compressed->section_direct)) {
+            return 1;
+        }
+    } else {
+        if (compressed->effective_rank != 0) {
+            return 1;
+        }
+        if (!section_has_storage(compressed->section_direct) ||
+            section_has_storage(compressed->section_u) ||
+            section_has_storage(compressed->section_s) ||
+            section_has_storage(compressed->section_v)) {
+            return 1;
+        }
+    }
+
+    const bool needs_quantization =
+        section_uses_quantization(compressed->section_u) ||
+        section_uses_quantization(compressed->section_s) ||
+        section_uses_quantization(compressed->section_v) ||
+        section_uses_quantization(compressed->section_direct);
+    if (needs_quantization && !cfg->quantization_initialized) {
+        return 1;
+    }
+
+    if (has_outlier_topk) {
+        if (!section_has_storage(compressed->section_outlier_topk) ||
+            compressed->section_outlier_topk.storage != BITSQZ_SECTION_TOPK ||
+            validate_topk_runtime_compatibility(cfg->outlier_topk, compressed, compressed->section_outlier_topk) != 0) {
+            return 1;
+        }
+    } else if (section_has_storage(compressed->section_outlier_topk)) {
+        return 1;
+    }
+
+    if (has_error_topk) {
+        if (!section_has_storage(compressed->section_error_topk) ||
+            compressed->section_error_topk.storage != BITSQZ_SECTION_TOPK ||
+            validate_topk_runtime_compatibility(cfg->error_topk, compressed, compressed->section_error_topk) != 0) {
+            return 1;
+        }
+    } else if (section_has_storage(compressed->section_error_topk)) {
+        return 1;
+    }
+
+    return 0;
+}
+
 } // namespace
 
 int bitsqz_llm_initialize(
@@ -1016,7 +1168,7 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *d_dst, ui
     if (dst_num_elements < compressed->num_elements) return 1;
 
     BitsqzRuntimeConfig &cfg = g_bitsqz_runtime;
-    if (cfg.num_rows != compressed->num_rows || cfg.num_columns != compressed->num_columns) {
+    if (validate_decompress_compatibility(&cfg, compressed) != 0) {
         return 1;
     }
 

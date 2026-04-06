@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <topk_cuda.cuh>
 
 namespace {
 
@@ -43,6 +44,20 @@ void measure_metrics(const std::vector<float> &orig,
     }
     *mae = sum_abs / static_cast<double>(orig.size());
     *mse = sum_sq / static_cast<double>(orig.size());
+}
+
+float smaller_topk_ratio(uint16_t cols, float ratio) {
+    if (ratio <= 0.0f) {
+        return 0.0f;
+    }
+
+    const uint16_t current_topk_columns = topk_compute_num_topk_columns(cols, ratio);
+    if (current_topk_columns <= 1) {
+        return 0.0f;
+    }
+
+    const float numerator = static_cast<float>(current_topk_columns - 1) - 0.49f;
+    return numerator > 0.0f ? numerator / static_cast<float>(cols) : 0.0f;
 }
 
 int run_case(const char *name,
@@ -100,33 +115,17 @@ int run_case(const char *name,
     }
     const double compress_latency_ms = elapsed_ms(compress_begin, Clock::now());
 
-    bitsqz_llm_release();
     std::vector<float> restored(source.size(), 0.0f);
     const auto decompress_begin = Clock::now();
-    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
-        std::fprintf(stderr, "%s: decompress should fail without initialize\n", name);
-        bitsqz_llm_free(compressed);
-        return 1;
-    }
-    if (bitsqz_llm_initialize(rows,
-                              cols,
-                              outlier_ratio,
-                              error_ratio,
-                              rank,
-                              niters,
-                              uv_format,
-                              s_format,
-                              quantization_INVALID) != 0) {
-        std::fprintf(stderr, "%s: re-initialize before decompress failed\n", name);
-        bitsqz_llm_free(compressed);
-        return 1;
-    }
     if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) != 0) {
-        std::fprintf(stderr, "%s: decompress failed\n", name);
+        std::fprintf(stderr, "%s: hot-path decompress failed\n", name);
         bitsqz_llm_free(compressed);
         bitsqz_llm_release();
         return 1;
     }
+    const double decompress_latency_ms = elapsed_ms(decompress_begin, Clock::now());
+
+    const auto restore_copy_begin = Clock::now();
     try {
         check_cuda(cudaMemcpy(
                        restored.data(),
@@ -140,7 +139,7 @@ int run_case(const char *name,
         bitsqz_llm_release();
         return 1;
     }
-    const double decompress_latency_ms = elapsed_ms(decompress_begin, Clock::now());
+    const double restore_copy_latency_ms = elapsed_ms(restore_copy_begin, Clock::now());
 
     if (compressed->effective_rank <= 0) {
         std::fprintf(stderr, "%s: invalid effective rank\n", name);
@@ -165,7 +164,9 @@ int run_case(const char *name,
     const double normalized_bits_per_value =
         static_cast<double>(packed) * 32.0 / static_cast<double>(baseline);
 
+    const auto load_begin = Clock::now();
     bitsqz_llm_array_t *loaded = load_bitsqz_llm_from_buffer(compressed, packed);
+    const double load_latency_ms = elapsed_ms(load_begin, Clock::now());
     if (!loaded) {
         std::fprintf(stderr, "%s: load_bitsqz_llm_from_buffer failed\n", name);
         bitsqz_llm_free(compressed);
@@ -173,23 +174,8 @@ int run_case(const char *name,
         return 1;
     }
 
-    bitsqz_llm_release();
     std::vector<float> restored_after_load(source.size(), 0.0f);
     const auto decompress_reload_begin = Clock::now();
-    if (bitsqz_llm_initialize(rows,
-                              cols,
-                              outlier_ratio,
-                              error_ratio,
-                              rank,
-                              niters,
-                              uv_format,
-                              s_format,
-                              quantization_INVALID) != 0) {
-        std::fprintf(stderr, "%s: re-initialize before reload decompress failed\n", name);
-        bitsqz_llm_free(loaded);
-        bitsqz_llm_free(compressed);
-        return 1;
-    }
     if (bitsqz_llm_decompress(loaded, buffers.d_restored, static_cast<uint32_t>(restored_after_load.size())) != 0) {
         std::fprintf(stderr, "%s: decompress after load failed\n", name);
         bitsqz_llm_free(loaded);
@@ -197,6 +183,9 @@ int run_case(const char *name,
         bitsqz_llm_release();
         return 1;
     }
+    const double decompress_after_load_latency_ms = elapsed_ms(decompress_reload_begin, Clock::now());
+
+    const auto reload_restore_copy_begin = Clock::now();
     try {
         check_cuda(cudaMemcpy(
                        restored_after_load.data(),
@@ -211,10 +200,122 @@ int run_case(const char *name,
         bitsqz_llm_release();
         return 1;
     }
-    const double decompress_after_load_latency_ms = elapsed_ms(decompress_reload_begin, Clock::now());
+    const double reload_restore_copy_latency_ms = elapsed_ms(reload_restore_copy_begin, Clock::now());
+
+    for (size_t i = 0; i < restored.size(); ++i) {
+        if (std::fabs(restored[i] - restored_after_load[i]) > 1e-5f) {
+            std::fprintf(stderr, "%s: reload mismatch at %zu\n", name, i);
+            bitsqz_llm_free(loaded);
+            bitsqz_llm_free(compressed);
+            bitsqz_llm_release();
+            return 1;
+        }
+    }
+
+    bitsqz_llm_release();
+    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
+        std::fprintf(stderr, "%s: decompress should fail after release\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
+
+    if (bitsqz_llm_initialize(rows,
+                              static_cast<uint16_t>(cols - 1),
+                              outlier_ratio,
+                              error_ratio,
+                              rank,
+                              niters,
+                              uv_format,
+                              s_format,
+                              quantization_INVALID) != 0) {
+        std::fprintf(stderr, "%s: incompatible shape initialize failed\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
+    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
+        std::fprintf(stderr, "%s: decompress should fail for shape mismatch\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        bitsqz_llm_release();
+        return 1;
+    }
+
+    if (bitsqz_llm_initialize(rows,
+                              cols,
+                              outlier_ratio,
+                              error_ratio,
+                              rank - 1,
+                              niters,
+                              uv_format,
+                              s_format,
+                              quantization_INVALID) != 0) {
+        std::fprintf(stderr, "%s: reduced-rank initialize failed\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        return 1;
+    }
+    if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
+        std::fprintf(stderr, "%s: decompress should fail with insufficient SVD capacity\n", name);
+        bitsqz_llm_free(loaded);
+        bitsqz_llm_free(compressed);
+        bitsqz_llm_release();
+        return 1;
+    }
+
+    if (uv_format != quantization_INVALID || s_format != quantization_INVALID) {
+        if (bitsqz_llm_initialize(rows,
+                                  cols,
+                                  outlier_ratio,
+                                  error_ratio,
+                                  rank,
+                                  niters,
+                                  quantization_INVALID,
+                                  quantization_INVALID,
+                                  quantization_INVALID) != 0) {
+            std::fprintf(stderr, "%s: missing-quantization initialize failed\n", name);
+            bitsqz_llm_free(loaded);
+            bitsqz_llm_free(compressed);
+            return 1;
+        }
+        if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
+            std::fprintf(stderr, "%s: decompress should fail without quantization runtime\n", name);
+            bitsqz_llm_free(loaded);
+            bitsqz_llm_free(compressed);
+            bitsqz_llm_release();
+            return 1;
+        }
+    }
+
+    const float smaller_outlier_ratio = smaller_topk_ratio(cols, outlier_ratio);
+    const float smaller_error_ratio = smaller_topk_ratio(cols, error_ratio);
+    if (smaller_outlier_ratio != outlier_ratio || smaller_error_ratio != error_ratio) {
+        if (bitsqz_llm_initialize(rows,
+                                  cols,
+                                  smaller_outlier_ratio,
+                                  smaller_error_ratio,
+                                  rank,
+                                  niters,
+                                  uv_format,
+                                  s_format,
+                                  quantization_INVALID) != 0) {
+            std::fprintf(stderr, "%s: reduced-topk-capacity initialize failed\n", name);
+            bitsqz_llm_free(loaded);
+            bitsqz_llm_free(compressed);
+            return 1;
+        }
+        if (bitsqz_llm_decompress(compressed, buffers.d_restored, static_cast<uint32_t>(restored.size())) == 0) {
+            std::fprintf(stderr, "%s: decompress should fail with insufficient topk capacity\n", name);
+            bitsqz_llm_free(loaded);
+            bitsqz_llm_free(compressed);
+            bitsqz_llm_release();
+            return 1;
+        }
+    }
 
     std::printf(
-        "[%s] packed=%llu bytes, baseline=%llu bytes, norm=%.6f bits/value, MAE=%.6f, MSE=%.6f, init=%.3f ms, compress=%.3f ms, decompress=%.3f ms, decompress_reload=%.3f ms\n"
+        "[%s] packed=%llu bytes, baseline=%llu bytes, norm=%.6f bits/value, MAE=%.6f, MSE=%.6f, init=%.3f ms, compress=%.3f ms, decompress_only=%.3f ms, restore_copy=%.3f ms, load=%.3f ms, decompress_reload_only=%.3f ms, reload_restore_copy=%.3f ms\n"
         "  compress_profile(ms): topk=%.3f, svd=%.3f, q_compress=%.3f, reconstruct_q_decompress=%.3f, reconstruct_svd=%.3f, error_extract=%.3f, other=%.3f\n",
                 name,
                 static_cast<unsigned long long>(packed),
@@ -225,7 +326,10 @@ int run_case(const char *name,
                 initialize_latency_ms,
                 compress_latency_ms,
                 decompress_latency_ms,
+                restore_copy_latency_ms,
+                load_latency_ms,
                 decompress_after_load_latency_ms,
+                reload_restore_copy_latency_ms,
                 compress_profile.topk_separation_latency_ms,
                 compress_profile.svd_lowrank_cuda_latency_ms,
                 compress_profile.quantization_compress_latency_ms,
