@@ -9,9 +9,7 @@ struct SVDLowrankCUDADevicePtrs {
     float* d_A = nullptr;
     float* d_R = nullptr;
     float* d_X = nullptr;
-    float* d_Q = nullptr;
     float* d_X_temp = nullptr;
-    float* d_Q_temp = nullptr;
     float* d_tau_M = nullptr;
     float* d_tau_N = nullptr;
     float* d_work = nullptr;

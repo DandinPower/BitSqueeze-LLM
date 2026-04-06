@@ -20,9 +20,7 @@ void SVDLowrankCUDADevicePtrs::free_all() noexcept {
     if (d_A) cudaFree(d_A);
     if (d_R) cudaFree(d_R);
     if (d_X) cudaFree(d_X);
-    if (d_Q) cudaFree(d_Q);
     if (d_X_temp) cudaFree(d_X_temp);
-    if (d_Q_temp) cudaFree(d_Q_temp);
     if (d_tau_M) cudaFree(d_tau_M);
     if (d_tau_N) cudaFree(d_tau_N);
     if (d_work) cudaFree(d_work);
@@ -36,9 +34,7 @@ void SVDLowrankCUDADevicePtrs::free_all() noexcept {
     d_A = nullptr;
     d_R = nullptr;
     d_X = nullptr;
-    d_Q = nullptr;
     d_X_temp = nullptr;
-    d_Q_temp = nullptr;
     d_tau_M = nullptr;
     d_tau_N = nullptr;
     d_work = nullptr;
@@ -156,9 +152,7 @@ void allocate_device_buffers(SVDLowrankCUDAContext* ctx) {
     check_cuda(cudaMalloc(&ctx->d.d_A, matrix_elements(ctx->m, ctx->n) * sizeof(float)), "cudaMalloc d_A failed");
     check_cuda(cudaMalloc(&ctx->d.d_R, matrix_elements(ctx->N_work, ctx->k) * sizeof(float)), "cudaMalloc d_R failed");
     check_cuda(cudaMalloc(&ctx->d.d_X, matrix_elements(ctx->M_work, ctx->k) * sizeof(float)), "cudaMalloc d_X failed");
-    check_cuda(cudaMalloc(&ctx->d.d_Q, matrix_elements(ctx->M_work, ctx->k) * sizeof(float)), "cudaMalloc d_Q failed");
     check_cuda(cudaMalloc(&ctx->d.d_X_temp, matrix_elements(ctx->N_work, ctx->k) * sizeof(float)), "cudaMalloc d_X_temp failed");
-    check_cuda(cudaMalloc(&ctx->d.d_Q_temp, matrix_elements(ctx->N_work, ctx->k) * sizeof(float)), "cudaMalloc d_Q_temp failed");
     check_cuda(cudaMalloc(&ctx->d.d_tau_M, static_cast<std::size_t>(ctx->k) * sizeof(float)), "cudaMalloc d_tau_M failed");
     check_cuda(cudaMalloc(&ctx->d.d_tau_N, static_cast<std::size_t>(ctx->k) * sizeof(float)), "cudaMalloc d_tau_N failed");
     check_cuda(cudaMalloc(&ctx->d.d_B, matrix_elements(ctx->k, ctx->N_work) * sizeof(float)), "cudaMalloc d_B failed");
@@ -185,7 +179,7 @@ void initialize_workspace_and_lwork(SVDLowrankCUDAContext* ctx) {
             ctx->M_work,
             ctx->k,
             ctx->k,
-            ctx->d.d_Q,
+            ctx->d.d_X,
             ctx->M_work,
             ctx->d.d_tau_M,
             &lwork_orgqr_M),
@@ -205,7 +199,7 @@ void initialize_workspace_and_lwork(SVDLowrankCUDAContext* ctx) {
             ctx->N_work,
             ctx->k,
             ctx->k,
-            ctx->d.d_Q_temp,
+            ctx->d.d_X_temp,
             ctx->N_work,
             ctx->d.d_tau_N,
             &lwork_orgqr_N),
@@ -258,9 +252,7 @@ void factor_to_orthonormal_basis(
     float* d_factor,
     int rows,
     float* d_tau,
-    float* d_basis,
     const char* geqrf_msg,
-    const char* copy_msg,
     const char* orgqr_msg) {
     check_cusolver(
         cusolverDnSgeqrf(
@@ -274,21 +266,13 @@ void factor_to_orthonormal_basis(
             ctx->lwork,
             ctx->d.d_devInfo),
         geqrf_msg);
-    check_cuda(
-        cudaMemcpyAsync(
-            d_basis,
-            d_factor,
-            matrix_elements(rows, ctx->k) * sizeof(float),
-            cudaMemcpyDeviceToDevice,
-            ctx->stream),
-        copy_msg);
     check_cusolver(
         cusolverDnSorgqr(
             ctx->cusolverH,
             rows,
             ctx->k,
             ctx->k,
-            d_basis,
+            d_factor,
             rows,
             d_tau,
             ctx->d.d_work,
@@ -328,9 +312,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
         ctx->d.d_X,
         ctx->M_work,
         ctx->d.d_tau_M,
-        ctx->d.d_Q,
         "cusolverDnSgeqrf initial failed",
-        "cudaMemcpyAsync X->Q failed",
         "cusolverDnSorgqr initial failed");
 
     for (int i = 0; i < iters; ++i) {
@@ -345,7 +327,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
                 &kAlpha,
                 ctx->d.d_A,
                 ctx->m,
-                ctx->d.d_Q,
+                ctx->d.d_X,
                 ctx->M_work,
                 &kBeta,
                 ctx->d.d_X_temp,
@@ -356,9 +338,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
             ctx->d.d_X_temp,
             ctx->N_work,
             ctx->d.d_tau_N,
-            ctx->d.d_Q_temp,
             "Power geqrf N failed",
-            "cudaMemcpyAsync X_temp->Q_temp failed",
             "Power orgqr N failed");
 
         check_cublas(
@@ -372,7 +352,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
                 &kAlpha,
                 ctx->d.d_A,
                 ctx->m,
-                ctx->d.d_Q_temp,
+                ctx->d.d_X_temp,
                 ctx->N_work,
                 &kBeta,
                 ctx->d.d_X,
@@ -383,9 +363,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
             ctx->d.d_X,
             ctx->M_work,
             ctx->d.d_tau_M,
-            ctx->d.d_Q,
             "Power geqrf M failed",
-            "cudaMemcpyAsync X->Q in power failed",
             "Power orgqr M failed");
     }
 
@@ -398,7 +376,7 @@ void run_lowrank_presvd_body(SVDLowrankCUDAContext* ctx, int niter) {
             ctx->N_work,
             ctx->M_work,
             &kAlpha,
-            ctx->d.d_Q,
+            ctx->d.d_X,
             ctx->M_work,
             ctx->d.d_A,
             ctx->m,
@@ -437,7 +415,7 @@ void run_lowrank_postsvd_body(SVDLowrankCUDAContext* ctx) {
             ctx->k,
             ctx->k,
             &kAlpha,
-            ctx->d.d_Q,
+            ctx->d.d_X,
             ctx->M_work,
             ctx->d.d_U_hat,
             ctx->k,
