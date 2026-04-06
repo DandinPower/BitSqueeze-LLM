@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(CUDAToolkit REQUIRED)
+
+if("@OpenMP_CXX_FOUND@" STREQUAL "TRUE")
+    find_dependency(OpenMP REQUIRED COMPONENTS CXX)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/bitsqz_llmTargets.cmake")
+
+check_required_components(bitsqz_llm)

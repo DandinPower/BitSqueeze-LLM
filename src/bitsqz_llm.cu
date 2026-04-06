@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <quantization_cuda/quantization_cuda.cuh>
 #include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.cuh>
 #include <svd_lowrank_cuda/svd_lowrank_cuda.cuh>
 #include <topk_cuda.cuh>

@@ -9,7 +9,8 @@ target_sources(reconstruct_lowrank_cuda_lib
 
 target_include_directories(reconstruct_lowrank_cuda_lib
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(reconstruct_lowrank_cuda_lib 

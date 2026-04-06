@@ -2,7 +2,35 @@
 
 #include <stdint.h>
 
-#include <quantization_cuda/quantization_cuda.cuh>
+#if defined(_WIN32)
+#if defined(BITSQZ_LLM_EXPORTS)
+#define BITSQZ_LLM_API __declspec(dllexport)
+#else
+#define BITSQZ_LLM_API __declspec(dllimport)
+#endif
+#else
+#define BITSQZ_LLM_API
+#endif
+
+#ifndef BITSQZ_LLM_QUANTIZATION_METHOD_T_DEFINED
+#define BITSQZ_LLM_QUANTIZATION_METHOD_T_DEFINED
+typedef enum {
+    quantization_INVALID = -1,
+    Q8_0 = 0,
+    Q4_0 = 1,
+    Q2_K = 2,
+    BF16 = 3,
+    FP16 = 4,
+    FP8 = 5,
+    FP4 = 6,
+    MXFP8 = 7,
+    MXFP4 = 8,
+    NVFP4 = 9,
+    NF4_DQ = 10,
+    NF4 = 11,
+    Q2_K_FAST = 12,
+} quantization_method_t;
+#endif
 
 typedef enum {
     BITSQZ_SECTION_NONE = 0,
@@ -59,7 +87,7 @@ typedef struct {
 } bitsqz_llm_compress_profile_t;
 
 /* Quantized formats accepted by bitsqz_llm are quantization_INVALID, NF4, and NF4_DQ. */
-int bitsqz_llm_initialize(
+BITSQZ_LLM_API int bitsqz_llm_initialize(
     uint16_t num_rows,
     uint16_t num_columns,
     float outlier_topk_ratio,
@@ -70,9 +98,9 @@ int bitsqz_llm_initialize(
     quantization_method_t svd_s_format,
     quantization_method_t quantization_only_format);
 
-void bitsqz_llm_release();
+BITSQZ_LLM_API void bitsqz_llm_release();
 
-int bitsqz_llm_compress(
+BITSQZ_LLM_API int bitsqz_llm_compress(
     const float *d_row_major_matrix_float_data,
     bitsqz_llm_array_t **out,
     bitsqz_llm_compress_profile_t *profile);
@@ -83,13 +111,13 @@ inline int bitsqz_llm_compress(
     return bitsqz_llm_compress(d_row_major_matrix_float_data, out, nullptr);
 }
 
-int bitsqz_llm_decompress(
+BITSQZ_LLM_API int bitsqz_llm_decompress(
     const bitsqz_llm_array_t *compressed,
     float *d_dst,
     uint32_t dst_num_elements);
 
-uint64_t bitsqz_llm_get_packed_size(const bitsqz_llm_array_t *compressed);
+BITSQZ_LLM_API uint64_t bitsqz_llm_get_packed_size(const bitsqz_llm_array_t *compressed);
 
-bitsqz_llm_array_t *load_bitsqz_llm_from_buffer(const void *buffer, uint64_t buffer_size);
+BITSQZ_LLM_API bitsqz_llm_array_t *load_bitsqz_llm_from_buffer(const void *buffer, uint64_t buffer_size);
 
-void bitsqz_llm_free(bitsqz_llm_array_t *compressed);
+BITSQZ_LLM_API void bitsqz_llm_free(bitsqz_llm_array_t *compressed);

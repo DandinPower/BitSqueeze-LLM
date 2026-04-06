@@ -85,6 +85,7 @@ function(add_bitsqz_llm_test target_name source_file)
     target_link_libraries(${target_name}
         PRIVATE
             bitsqz_llm_lib
+            topk_cuda_lib
             CUDA::cudart
     )
 endfunction()
