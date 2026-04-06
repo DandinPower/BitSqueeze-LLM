@@ -11,6 +11,19 @@ target_link_libraries(svd_lowrank_cuda_tests
         CUDA::cudart
 )
 
+add_executable(svd_lowrank_cuda_nsys_profile)
+
+target_sources(svd_lowrank_cuda_nsys_profile
+    PRIVATE
+        svd_lowrank_cuda/test_svd_lowrank_cuda_nsys.cu
+)
+
+target_link_libraries(svd_lowrank_cuda_nsys_profile
+    PRIVATE
+        svd_lowrank_cuda_lib
+        CUDA::cudart
+)
+
 function(add_reconstruct_lowrank_cuda_test target_name source_file)
     add_executable(${target_name})
     target_sources(${target_name}
