@@ -15,9 +15,9 @@
 
 #include <cuda_runtime.h>
 
-#include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.hpp>
-#include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
-#include <topk.hpp>
+#include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.cuh>
+#include <svd_lowrank_cuda/svd_lowrank_cuda.cuh>
+#include <topk.cuh>
 
 namespace {
 

@@ -4,7 +4,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.hpp>
+#include <reconstruct_lowrank_cuda/reconstruct_lowrank_cuda.cuh>
 
 namespace {
 

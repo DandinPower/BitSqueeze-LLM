@@ -2,9 +2,15 @@ cmake_minimum_required(VERSION 3.23)
 
 project(svd_lowrank_cuda LANGUAGES CXX CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES 80)    # Compile the generation after A100 (https://developer.nvidia.com/cuda/gpus)
+# Compile the generation after A100 (https://developer.nvidia.com/cuda/gpus)
+set(CMAKE_CUDA_ARCHITECTURES 80)    #
 
 find_package(CUDAToolkit REQUIRED)
+
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+)
 
 add_subdirectory(tests)
 

@@ -1,4 +1,4 @@
-#include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
+#include <svd_lowrank_cuda/svd_lowrank_cuda.cuh>
 
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>

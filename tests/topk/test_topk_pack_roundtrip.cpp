@@ -9,7 +9,7 @@
 
 #include <cuda_runtime.h>
 
-#include <topk.hpp>
+#include <topk.cuh>
 
 namespace {
 

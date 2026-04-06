@@ -1,4 +1,4 @@
-#include <svd_lowrank_cuda/svd_lowrank_cuda.hpp>
+#include <svd_lowrank_cuda/svd_lowrank_cuda.cuh>
 
 #include "svd_lowrank_cuda_utils.cuh"
 
