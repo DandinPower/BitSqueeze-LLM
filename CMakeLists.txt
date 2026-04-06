@@ -14,11 +14,12 @@ add_compile_options(
 
 add_subdirectory(tests)
 
-add_subdirectory(modules/quantization)
+add_subdirectory(legacy_modules/quantization)
+add_subdirectory(modules/quantization_cuda)
 
 add_subdirectory(modules/svd_lowrank_cuda)
 
-add_subdirectory(modules/topk)
+add_subdirectory(modules/topk_cuda)
 
 add_subdirectory(modules/reconstruct_lowrank_cuda)
 
@@ -36,8 +37,8 @@ target_include_directories(bitsqz_llm_lib
 )
 target_link_libraries(bitsqz_llm_lib
     PUBLIC
-        quantization_lib
-        topk_lib
+        quantization_cuda_lib
+        topk_cuda_lib
         svd_lowrank_cuda_lib
         reconstruct_lowrank_cuda_lib
     PRIVATE

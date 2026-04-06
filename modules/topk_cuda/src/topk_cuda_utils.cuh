@@ -1,6 +1,6 @@
 #pragma once
 
-#include <topk.cuh>
+#include <topk_cuda.cuh>
 
 #include <cmath>
 #include <cstddef>

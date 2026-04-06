@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#include <quantization/quantization.hpp>
+#include <quantization_cuda/quantization_cuda.cuh>
 
 typedef enum {
     BITSQZ_SECTION_NONE = 0,
@@ -58,6 +58,7 @@ typedef struct {
     double other_latency_ms;
 } bitsqz_llm_compress_profile_t;
 
+/* Quantized formats accepted by bitsqz_llm are quantization_INVALID, NF4, and NF4_DQ. */
 int bitsqz_llm_initialize(
     uint16_t num_rows,
     uint16_t num_columns,

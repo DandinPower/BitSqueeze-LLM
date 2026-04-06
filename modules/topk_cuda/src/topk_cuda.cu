@@ -1,6 +1,6 @@
-#include <topk.cuh>
+#include <topk_cuda.cuh>
 
-#include "topk_utils.cuh"
+#include "topk_cuda_utils.cuh"
 
 #include <cmath>
 #include <cstdint>

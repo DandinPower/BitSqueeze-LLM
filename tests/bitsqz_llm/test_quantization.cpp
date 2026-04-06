@@ -54,7 +54,8 @@ int run_case(const char *name,
              uint16_t rows,
              uint16_t cols,
              float outlier_ratio,
-             float error_ratio) {
+             float error_ratio,
+             quantization_method_t direct_format) {
     using Clock = std::chrono::steady_clock;
     auto elapsed_ms = [](const Clock::time_point &begin, const Clock::time_point &end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -64,12 +65,12 @@ int run_case(const char *name,
     try {
         check_cuda(cudaMalloc(&buffers.d_source, source.size() * sizeof(float)), "cudaMalloc d_source failed");
         check_cuda(cudaMalloc(&buffers.d_restored, source.size() * sizeof(float)), "cudaMalloc d_restored failed");
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        buffers.d_source,
                        source.data(),
                        source.size() * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpyAsync source H2D failed");
+                   "cudaMemcpy source H2D failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: device setup failed: %s\n", name, e.what());
         return 1;
@@ -84,7 +85,7 @@ int run_case(const char *name,
                               2,
                               quantization_INVALID,
                               quantization_INVALID,
-                              Q8_0) != 0) {
+                              direct_format) != 0) {
         std::fprintf(stderr, "%s: initialize failed\n", name);
         return 1;
     }
@@ -116,7 +117,7 @@ int run_case(const char *name,
                               2,
                               quantization_INVALID,
                               quantization_INVALID,
-                              Q8_0) != 0) {
+                              direct_format) != 0) {
         std::fprintf(stderr, "%s: re-initialize before decompress failed\n", name);
         bitsqz_llm_free(compressed);
         return 1;
@@ -128,12 +129,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        restored.data(),
                        buffers.d_restored,
                        restored.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpyAsync restored D2H failed");
+                   "cudaMemcpy restored D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(compressed);
@@ -184,7 +185,7 @@ int run_case(const char *name,
                               2,
                               quantization_INVALID,
                               quantization_INVALID,
-                              Q8_0) != 0) {
+                              direct_format) != 0) {
         std::fprintf(stderr, "%s: re-initialize before reload decompress failed\n", name);
         bitsqz_llm_free(loaded);
         bitsqz_llm_free(compressed);
@@ -198,12 +199,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        restored_after_load.data(),
                        buffers.d_restored,
                        restored_after_load.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpyAsync restored_after_load D2H failed");
+                   "cudaMemcpy restored_after_load D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: reload restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(loaded);
@@ -255,6 +256,22 @@ int run_case(const char *name,
 int main(void) {
     const uint16_t rows = 512;
     const uint16_t cols = 8192;
+
+    if (bitsqz_llm_initialize(
+            rows,
+            cols,
+            0.0f,
+            0.0f,
+            -1,
+            2,
+            quantization_INVALID,
+            quantization_INVALID,
+            Q8_0) == 0) {
+        std::fprintf(stderr, "bitsqz_llm_initialize should reject Q8_0\n");
+        bitsqz_llm_release();
+        return EXIT_FAILURE;
+    }
+
     std::vector<float> source(static_cast<size_t>(rows) * cols, 0.0f);
 
     for (uint16_t r = 0; r < rows; ++r) {
@@ -264,10 +281,10 @@ int main(void) {
         }
     }
 
-    if (run_case("quantization_only", source, rows, cols, 0.0f, 0.0f) != 0) return EXIT_FAILURE;
-    if (run_case("quantization_plus_error", source, rows, cols, 0.0f, 0.10f) != 0) return EXIT_FAILURE;
-    if (run_case("outlier_plus_quantization", source, rows, cols, 0.05f, 0.0f) != 0) return EXIT_FAILURE;
-    if (run_case("outlier_quantization_error", source, rows, cols, 0.05f, 0.10f) != 0) return EXIT_FAILURE;
+    if (run_case("quantization_only_nf4", source, rows, cols, 0.0f, 0.0f, NF4) != 0) return EXIT_FAILURE;
+    if (run_case("quantization_plus_error_nf4", source, rows, cols, 0.0f, 0.10f, NF4) != 0) return EXIT_FAILURE;
+    if (run_case("outlier_plus_quantization_nf4_dq", source, rows, cols, 0.05f, 0.0f, NF4_DQ) != 0) return EXIT_FAILURE;
+    if (run_case("outlier_quantization_error_nf4_dq", source, rows, cols, 0.05f, 0.10f, NF4_DQ) != 0) return EXIT_FAILURE;
 
     std::printf("bitsqz_llm no-svd test passed\n");
     return EXIT_SUCCESS;

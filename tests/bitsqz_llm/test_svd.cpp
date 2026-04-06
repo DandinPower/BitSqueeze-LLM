@@ -64,12 +64,12 @@ int run_case(const char *name,
     try {
         check_cuda(cudaMalloc(&buffers.d_source, source.size() * sizeof(float)), "cudaMalloc d_source failed");
         check_cuda(cudaMalloc(&buffers.d_restored, source.size() * sizeof(float)), "cudaMalloc d_restored failed");
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        buffers.d_source,
                        source.data(),
                        source.size() * sizeof(float),
                        cudaMemcpyHostToDevice),
-                   "cudaMemcpyAsync source H2D failed");
+                   "cudaMemcpy source H2D failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: device setup failed: %s\n", name, e.what());
         return 1;
@@ -128,12 +128,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        restored.data(),
                        buffers.d_restored,
                        restored.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpyAsync restored D2H failed");
+                   "cudaMemcpy restored D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(compressed);
@@ -198,12 +198,12 @@ int run_case(const char *name,
         return 1;
     }
     try {
-        check_cuda(cudaMemcpyAsync(
+        check_cuda(cudaMemcpy(
                        restored_after_load.data(),
                        buffers.d_restored,
                        restored_after_load.size() * sizeof(float),
                        cudaMemcpyDeviceToHost),
-                   "cudaMemcpyAsync restored_after_load D2H failed");
+                   "cudaMemcpy restored_after_load D2H failed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s: reload restore copy failed: %s\n", name, e.what());
         bitsqz_llm_free(loaded);
@@ -245,6 +245,22 @@ int run_case(const char *name,
 int main(void) {
     const uint16_t rows = 512;
     const uint16_t cols = 8192;
+
+    if (bitsqz_llm_initialize(
+            rows,
+            cols,
+            0.0f,
+            0.0f,
+            128,
+            2,
+            Q8_0,
+            quantization_INVALID,
+            quantization_INVALID) == 0) {
+        std::fprintf(stderr, "bitsqz_llm_initialize should reject Q8_0 SVD formats\n");
+        bitsqz_llm_release();
+        return EXIT_FAILURE;
+    }
+
     std::vector<float> source(static_cast<size_t>(rows) * cols, 0.0f);
 
     for (uint16_t r = 0; r < rows; ++r) {
@@ -260,24 +276,24 @@ int main(void) {
     if (run_case("svd_only", source, rows, cols, 0.0f, 0.0f, quantization_INVALID, quantization_INVALID, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
-    if (run_case("svd_quantization", source, rows, cols, 0.0f, 0.0f, Q8_0, Q8_0, 128, 2) != 0) return EXIT_FAILURE;
+    if (run_case("svd_quantization_nf4", source, rows, cols, 0.0f, 0.0f, NF4, NF4, 128, 2) != 0) return EXIT_FAILURE;
     if (run_case("svd_error", source, rows, cols, 0.0f, 0.10f, quantization_INVALID, quantization_INVALID, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
-    if (run_case("svd_quantization_error", source, rows, cols, 0.0f, 0.10f, Q8_0, Q8_0, 128, 2) != 0) return EXIT_FAILURE;
+    if (run_case("svd_quantization_error_nf4", source, rows, cols, 0.0f, 0.10f, NF4, NF4, 128, 2) != 0) return EXIT_FAILURE;
     if (run_case("outlier_svd", source, rows, cols, 0.05f, 0.0f, quantization_INVALID, quantization_INVALID, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
     if (run_case("outlier_svd_error", source, rows, cols, 0.05f, 0.10f, quantization_INVALID, quantization_INVALID, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
-    if (run_case("outlier_svd_quantization_error", source, rows, cols, 0.05f, 0.10f, Q8_0, Q8_0, 128, 2) != 0) {
+    if (run_case("outlier_svd_quantization_error_nf4_dq", source, rows, cols, 0.05f, 0.10f, NF4_DQ, NF4, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
-    if (run_case("outlier_svd_quantization_error_best", source, rows, cols, 0.001f, 0.015f, NF4_DQ, quantization_INVALID, 128, 2) != 0) {
+    if (run_case("outlier_svd_quantization_error_best_nf4_dq", source, rows, cols, 0.001f, 0.015f, NF4_DQ, quantization_INVALID, 128, 2) != 0) {
         return EXIT_FAILURE;
     }
-    if (run_case("outlier_svd_quantization_error_best", source, rows, cols, 0.001f, 0.015f, NF4_DQ, quantization_INVALID, 128, 6) != 0) {
+    if (run_case("outlier_svd_quantization_error_best_nf4_dq_iter6", source, rows, cols, 0.001f, 0.015f, NF4_DQ, quantization_INVALID, 128, 6) != 0) {
         return EXIT_FAILURE;
     }
 

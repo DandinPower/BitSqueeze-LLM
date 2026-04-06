@@ -11,7 +11,7 @@
 
 #include <cuda_runtime.h>
 
-#include <topk.cuh>
+#include <topk_cuda.cuh>
 
 namespace {
 

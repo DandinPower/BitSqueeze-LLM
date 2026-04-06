@@ -49,7 +49,7 @@ function(add_quantization_test target_name source_file)
     )
 endfunction()
 
-function(add_topk_test target_name source_file)
+function(add_quantization_cuda_test target_name source_file)
     add_executable(${target_name})
     target_sources(${target_name}
         PRIVATE
@@ -57,7 +57,21 @@ function(add_topk_test target_name source_file)
     )
     target_link_libraries(${target_name}
         PRIVATE
-            topk_lib
+            quantization_cuda_lib
+            quantization_lib
+            CUDA::cudart
+    )
+endfunction()
+
+function(add_topk_cuda_test target_name source_file)
+    add_executable(${target_name})
+    target_sources(${target_name}
+        PRIVATE
+            ${source_file}
+    )
+    target_link_libraries(${target_name}
+        PRIVATE
+            topk_cuda_lib
             CUDA::cudart
     )
 endfunction()
@@ -88,10 +102,12 @@ add_quantization_test(quantization_mxfp4_tests quantization/test_mxfp4_impl.cpp)
 add_quantization_test(quantization_nvfp4_tests quantization/test_nvfp4_impl.cpp)
 add_quantization_test(quantization_nf4_tests quantization/test_nf4_impl.cpp)
 add_quantization_test(quantization_nf4_dq_tests quantization/test_nf4_dq_impl.cpp)
+add_quantization_cuda_test(quantization_cuda_nf4_tests quantization_cuda/test_nf4_cuda.cu)
+add_quantization_cuda_test(quantization_cuda_nf4_dq_tests quantization_cuda/test_nf4_dq_cuda.cu)
 
-add_topk_test(topk_extraction_tests topk/test_topk_extraction.cpp)
-add_topk_test(topk_separation_tests topk/test_topk_separation.cpp)
-add_topk_test(topk_pack_roundtrip_tests topk/test_topk_pack_roundtrip.cpp)
+add_topk_cuda_test(topk_cuda_extraction_tests topk_cuda/test_topk_cuda_extraction.cpp)
+add_topk_cuda_test(topk_cuda_separation_tests topk_cuda/test_topk_cuda_separation.cpp)
+add_topk_cuda_test(topk_cuda_pack_roundtrip_tests topk_cuda/test_topk_cuda_pack_roundtrip.cpp)
 
 add_bitsqz_llm_test(bitsqz_llm_quantization_tests bitsqz_llm/test_quantization.cpp)
 add_bitsqz_llm_test(bitsqz_llm_svd_tests bitsqz_llm/test_svd.cpp)

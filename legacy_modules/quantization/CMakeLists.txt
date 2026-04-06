@@ -23,6 +23,7 @@ target_sources(quantization_lib
 target_include_directories(quantization_lib
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include/
+        ${CMAKE_SOURCE_DIR}/modules/quantization_cuda/include
 )
 
 if(OpenMP_CXX_FOUND)
