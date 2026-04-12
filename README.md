@@ -195,3 +195,17 @@ cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DBITSQZ_LLM_BUILD_EXAMPLES=ON
 cmake --build build --target bitsqz_llm_walkthrough -j
 ./build/examples/bitsqz_llm_walkthrough
 ```
+
+## Citation
+
+If you use `bitsqz_llm` in your research or project, please cite it as follows:
+
+### BibTeX
+
+```bibtex
+@software{bitsqz_llm,
+  author = {Yong-Cheng Liaw and Gata.xyz},
+  title = {BitSqueeze-LLM: CUDA-backed Matrix Compression for LLM Activations},
+  year = {2026},
+  url = {https://github.com/DandinPower/BitSqueeze-LLM}
+}
