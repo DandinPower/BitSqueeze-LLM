@@ -24,7 +24,12 @@ double mean_absolute_error(const std::vector<float> &lhs, const std::vector<floa
     return total / static_cast<double>(lhs.size());
 }
 
-}  // namespace
+void release_runtimes() {
+    bitsqz_llm_compress_release();
+    bitsqz_llm_decompress_release();
+}
+
+} // namespace
 
 int main() {
     constexpr uint16_t rows = 8;
@@ -35,22 +40,13 @@ int main() {
         host_matrix[i] = static_cast<float>((i % cols) * 0.25f + (i / cols) * 0.5f);
     }
 
-    float *d_source = nullptr;
     float *d_restored = nullptr;
     bitsqz_llm_array_t *compressed = nullptr;
 
     try {
-        check_cuda(cudaMalloc(&d_source, host_matrix.size() * sizeof(float)), "cudaMalloc d_source failed");
         check_cuda(cudaMalloc(&d_restored, host_matrix.size() * sizeof(float)), "cudaMalloc d_restored failed");
-        check_cuda(
-            cudaMemcpy(
-                d_source,
-                host_matrix.data(),
-                host_matrix.size() * sizeof(float),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy host->device failed");
 
-        if (bitsqz_llm_initialize(
+        if (bitsqz_llm_compress_initialize(
                 rows,
                 cols,
                 0.0f,
@@ -59,22 +55,38 @@ int main() {
                 2,
                 NF4,
                 NF4,
-                quantization_INVALID) != 0) {
-            std::fprintf(stderr, "bitsqz_llm_initialize failed\n");
+                quantization_NONE,
+                BITSQZ_LLM_INPUT_HOST) != 0) {
+            std::fprintf(stderr, "bitsqz_llm_compress_initialize failed\n");
+            return 1;
+        }
+
+        if (bitsqz_llm_decompress_initialize(
+                rows,
+                cols,
+                0.0f,
+                0.0f,
+                // Decompressor SVD size must exactly match the packed SVD rank.
+                4,
+                NF4,
+                NF4,
+                quantization_NONE) != 0) {
+            std::fprintf(stderr, "bitsqz_llm_decompress_initialize failed\n");
+            bitsqz_llm_compress_release();
             return 1;
         }
 
         bitsqz_llm_compress_profile_t profile{};
-        if (bitsqz_llm_compress(d_source, &compressed, &profile) != 0 || compressed == nullptr) {
+        if (bitsqz_llm_compress(host_matrix.data(), &compressed, &profile) != 0 || compressed == nullptr) {
             std::fprintf(stderr, "bitsqz_llm_compress failed\n");
-            bitsqz_llm_release();
+            release_runtimes();
             return 1;
         }
 
         if (bitsqz_llm_decompress(compressed, d_restored, static_cast<uint32_t>(host_matrix.size())) != 0) {
             std::fprintf(stderr, "bitsqz_llm_decompress failed\n");
             bitsqz_llm_free(compressed);
-            bitsqz_llm_release();
+            release_runtimes();
             return 1;
         }
 
@@ -88,20 +100,19 @@ int main() {
             "cudaMemcpy device->host failed");
 
         std::printf("rows=%u cols=%u\n", rows, cols);
+        std::printf("compress_input=host\n");
         std::printf("packed_size=%llu bytes\n", static_cast<unsigned long long>(bitsqz_llm_get_packed_size(compressed)));
         std::printf("effective_rank=%d\n", static_cast<int>(compressed->effective_rank));
         std::printf("mae=%f\n", mean_absolute_error(host_matrix, restored));
         std::printf("compress_ms=%f\n", profile.quantization_compress_latency_ms + profile.reconstruct_svd_latency_ms);
 
         bitsqz_llm_free(compressed);
-        bitsqz_llm_release();
-        cudaFree(d_source);
+        release_runtimes();
         cudaFree(d_restored);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "example failed: %s\n", e.what());
         bitsqz_llm_free(compressed);
-        bitsqz_llm_release();
-        cudaFree(d_source);
+        release_runtimes();
         cudaFree(d_restored);
         return 1;
     }

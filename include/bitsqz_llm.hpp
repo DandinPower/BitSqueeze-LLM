@@ -15,7 +15,8 @@
 #ifndef BITSQZ_LLM_QUANTIZATION_METHOD_T_DEFINED
 #define BITSQZ_LLM_QUANTIZATION_METHOD_T_DEFINED
 typedef enum {
-    quantization_INVALID = -1,
+    quantization_NONE = -1, // Disable quantization for this section and store it in FP32 form.
+    quantization_INVALID = quantization_NONE,   // Backward-compatible alias retained for older callers.
     Q8_0 = 0,
     Q4_0 = 1,
     Q2_K = 2,
@@ -38,6 +39,11 @@ typedef enum {
     BITSQZ_SECTION_QUANT = 2,
     BITSQZ_SECTION_TOPK = 3,
 } bitsqz_section_storage_t;
+
+typedef enum {
+    BITSQZ_LLM_INPUT_HOST = 0,
+    BITSQZ_LLM_INPUT_DEVICE = 1,
+} bitsqz_llm_input_location_t;
 
 typedef struct {
     uint64_t offset;
@@ -86,8 +92,7 @@ typedef struct {
     double other_latency_ms;
 } bitsqz_llm_compress_profile_t;
 
-/* Quantized formats accepted by bitsqz_llm are quantization_INVALID, NF4, and NF4_DQ. */
-BITSQZ_LLM_API int bitsqz_llm_initialize(
+BITSQZ_LLM_API int bitsqz_llm_compress_initialize(
     uint16_t num_rows,
     uint16_t num_columns,
     float outlier_topk_ratio,
@@ -96,19 +101,32 @@ BITSQZ_LLM_API int bitsqz_llm_initialize(
     int svd_niters,
     quantization_method_t svd_uv_format,
     quantization_method_t svd_s_format,
+    quantization_method_t quantization_only_format,
+    bitsqz_llm_input_location_t input_location);
+
+BITSQZ_LLM_API void bitsqz_llm_compress_release();
+
+BITSQZ_LLM_API int bitsqz_llm_decompress_initialize(
+    uint16_t num_rows,
+    uint16_t num_columns,
+    float outlier_topk_ratio,
+    float error_correction_topk_ratio,
+    int svd_ranks,
+    quantization_method_t svd_uv_format,
+    quantization_method_t svd_s_format,
     quantization_method_t quantization_only_format);
 
-BITSQZ_LLM_API void bitsqz_llm_release();
+BITSQZ_LLM_API void bitsqz_llm_decompress_release();
 
 BITSQZ_LLM_API int bitsqz_llm_compress(
-    const float *d_row_major_matrix_float_data,
+    const float *row_major_matrix_float_data,
     bitsqz_llm_array_t **out,
     bitsqz_llm_compress_profile_t *profile);
 
 inline int bitsqz_llm_compress(
-    const float *d_row_major_matrix_float_data,
+    const float *row_major_matrix_float_data,
     bitsqz_llm_array_t **out) {
-    return bitsqz_llm_compress(d_row_major_matrix_float_data, out, nullptr);
+    return bitsqz_llm_compress(row_major_matrix_float_data, out, nullptr);
 }
 
 BITSQZ_LLM_API int bitsqz_llm_decompress(

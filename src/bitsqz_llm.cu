@@ -31,6 +31,7 @@ enum : uint32_t {
 constexpr int kBlockSize = 256;
 
 struct BitsqzCUDADeviceBuffers {
+    float *d_input_stage = nullptr;
     float *d_residual = nullptr;
     float *d_u = nullptr;
     float *d_s = nullptr;
@@ -45,6 +46,7 @@ struct BitsqzCUDADeviceBuffers {
     uint8_t *d_quant_data = nullptr;
 
     void free_all() noexcept {
+        if (d_input_stage) cudaFree(d_input_stage);
         if (d_residual) cudaFree(d_residual);
         if (d_u) cudaFree(d_u);
         if (d_s) cudaFree(d_s);
@@ -57,6 +59,7 @@ struct BitsqzCUDADeviceBuffers {
         if (d_quant_dq_scale) cudaFree(d_quant_dq_scale);
         if (d_quant_data) cudaFree(d_quant_data);
 
+        d_input_stage = nullptr;
         d_residual = nullptr;
         d_u = nullptr;
         d_s = nullptr;
@@ -119,10 +122,11 @@ struct BitsqzRuntimeConfig {
     float error_correction_topk_ratio = 0.0f;
     int svd_ranks = -1;
     int svd_niters = 1;
-    int svd_rank_capacity = 0;
-    quantization_method_t svd_uv_format = quantization_INVALID;
-    quantization_method_t svd_s_format = quantization_INVALID;
-    quantization_method_t quantization_only_format = quantization_INVALID;
+    int svd_allocated_rank = 0;
+    quantization_method_t svd_uv_format = quantization_NONE;
+    quantization_method_t svd_s_format = quantization_NONE;
+    quantization_method_t quantization_only_format = quantization_NONE;
+    bitsqz_llm_input_location_t input_location = BITSQZ_LLM_INPUT_DEVICE;
     QuantizationCUDAContext quantization_ctx{};
     ReconstructLowrankCUDAContext reconstruct_ctx{};
     BitsqzCUDADeviceBuffers device_buffers{};
@@ -130,20 +134,25 @@ struct BitsqzRuntimeConfig {
     BitsqzTopkRuntime error_topk{};
 };
 
-BitsqzRuntimeConfig g_bitsqz_runtime;
+BitsqzRuntimeConfig g_bitsqz_compress_runtime;
+BitsqzRuntimeConfig g_bitsqz_decompress_runtime;
 
 static bool ratio_is_valid(float ratio) {
     return std::isfinite(ratio) && ratio >= 0.0f && ratio <= 1.0f;
 }
 
 static bool quant_method_is_valid(quantization_method_t method) {
-    return method == quantization_INVALID || method == NF4 || method == NF4_DQ;
+    return method == quantization_NONE || method == NF4 || method == NF4_DQ;
+}
+
+static bool input_location_is_valid(bitsqz_llm_input_location_t input_location) {
+    return input_location == BITSQZ_LLM_INPUT_HOST || input_location == BITSQZ_LLM_INPUT_DEVICE;
 }
 
 static bool config_uses_quantization(const BitsqzRuntimeConfig &cfg) {
-    return cfg.svd_uv_format != quantization_INVALID ||
-           cfg.svd_s_format != quantization_INVALID ||
-           cfg.quantization_only_format != quantization_INVALID;
+    return cfg.svd_uv_format != quantization_NONE ||
+           cfg.svd_s_format != quantization_NONE ||
+           cfg.quantization_only_format != quantization_NONE;
 }
 
 static void check_cuda(cudaError_t status, const char *msg) {
@@ -179,6 +188,8 @@ static void allocate_bitsqz_device_buffers(
     uint16_t rows,
     uint16_t cols,
     int rank,
+    bool allocate_input_stage,
+    bool allocate_compression_buffers,
     bool allocate_svd_buffers,
     bool allocate_quant_buffers) {
     if (buffers == nullptr) {
@@ -194,10 +205,16 @@ static void allocate_bitsqz_device_buffers(
     const std::size_t matrix_count = static_cast<std::size_t>(rows) * cols;
     buffers->free_all();
 
-    check_cuda(cudaMalloc(&buffers->d_residual, matrix_count * sizeof(float)), "cudaMalloc d_residual failed");
-    check_cuda(cudaMalloc(&buffers->d_reconstructed, matrix_count * sizeof(float)), "cudaMalloc d_reconstructed failed");
-    check_cuda(cudaMalloc(&buffers->d_error, matrix_count * sizeof(float)), "cudaMalloc d_error failed");
-    check_cuda(cudaMalloc(&buffers->d_has_nonzero, sizeof(int)), "cudaMalloc d_has_nonzero failed");
+    if (allocate_input_stage) {
+        check_cuda(cudaMalloc(&buffers->d_input_stage, matrix_count * sizeof(float)), "cudaMalloc d_input_stage failed");
+    }
+
+    if (allocate_compression_buffers) {
+        check_cuda(cudaMalloc(&buffers->d_residual, matrix_count * sizeof(float)), "cudaMalloc d_residual failed");
+        check_cuda(cudaMalloc(&buffers->d_reconstructed, matrix_count * sizeof(float)), "cudaMalloc d_reconstructed failed");
+        check_cuda(cudaMalloc(&buffers->d_error, matrix_count * sizeof(float)), "cudaMalloc d_error failed");
+        check_cuda(cudaMalloc(&buffers->d_has_nonzero, sizeof(int)), "cudaMalloc d_has_nonzero failed");
+    }
 
     if (allocate_svd_buffers) {
         const std::size_t u_count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(rank);
@@ -323,12 +340,12 @@ static int copy_device_buffer_to_host(
     try {
         dst->resize(static_cast<std::size_t>(count));
         check_cuda(
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 dst->data(),
                 d_src,
                 static_cast<std::size_t>(count) * sizeof(float),
                 cudaMemcpyDeviceToHost),
-            "cudaMemcpy D2H failed");
+            "cudaMemcpyAsync D2H failed");
         return 0;
     } catch (const std::exception &) {
         return 1;
@@ -343,12 +360,12 @@ static int copy_host_buffer_to_device(
 
     try {
         check_cuda(
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 d_dst,
                 src,
                 static_cast<std::size_t>(count) * sizeof(float),
                 cudaMemcpyHostToDevice),
-            "cudaMemcpy H2D failed");
+            "cudaMemcpyAsync H2D failed");
         return 0;
     } catch (const std::exception &) {
         return 1;
@@ -396,8 +413,8 @@ static int device_buffer_has_nonzero(
 
         int host_flag = 0;
         check_cuda(
-            cudaMemcpy(&host_flag, buffers->d_has_nonzero, sizeof(int), cudaMemcpyDeviceToHost),
-            "cudaMemcpy d_has_nonzero failed");
+            cudaMemcpyAsync(&host_flag, buffers->d_has_nonzero, sizeof(int), cudaMemcpyDeviceToHost),
+            "cudaMemcpyAsync d_has_nonzero failed");
         *out_has_nonzero = (host_flag != 0);
         return 0;
     } catch (const std::exception &) {
@@ -573,7 +590,7 @@ static int decode_section_to_device(
     }
 
     if (section.storage == BITSQZ_SECTION_QUANT) {
-        if (compressed->payload == nullptr || method == quantization_INVALID) {
+        if (compressed->payload == nullptr || method == quantization_NONE) {
             return 1;
         }
         const auto *payload = static_cast<const uint8_t *>(compressed->payload);
@@ -604,10 +621,10 @@ static int validate_section_method_pair(
         return 0;
     }
     if (section.storage == BITSQZ_SECTION_FP32) {
-        return method == quantization_INVALID ? 0 : 1;
+        return method == quantization_NONE ? 0 : 1;
     }
     if (section.storage == BITSQZ_SECTION_QUANT) {
-        return method != quantization_INVALID && quant_method_is_valid(method) ? 0 : 1;
+        return method != quantization_NONE && quant_method_is_valid(method) ? 0 : 1;
     }
     return 1;
 }
@@ -688,7 +705,9 @@ static int validate_decompress_compatibility(
         if (rank == 0) {
             return 1;
         }
-        if (!cfg->reconstruct_initialized || cfg->svd_rank_capacity < static_cast<int>(rank)) {
+        if (!cfg->reconstruct_initialized ||
+            cfg->svd_ranks != static_cast<int>(rank) ||
+            cfg->svd_allocated_rank != static_cast<int>(rank)) {
             return 1;
         }
         if (!section_has_storage(compressed->section_u) ||
@@ -743,13 +762,138 @@ static int validate_decompress_compatibility(
 
 } // namespace
 
-int bitsqz_llm_initialize(
+static void release_runtime(BitsqzRuntimeConfig *runtime) {
+    if (runtime == nullptr) {
+        return;
+    }
+
+    runtime->outlier_topk.release();
+    runtime->error_topk.release();
+    runtime->device_buffers.free_all();
+    if (runtime->quantization_initialized) {
+        quantization_cuda_release(&runtime->quantization_ctx);
+    }
+    if (runtime->svd_initialized) {
+        svd_lowrank_cuda_release();
+    }
+    if (runtime->reconstruct_initialized) {
+        reconstruct_lowrank_cuda_release(&runtime->reconstruct_ctx);
+    }
+    *runtime = BitsqzRuntimeConfig{};
+}
+
+int bitsqz_llm_compress_initialize(
     uint16_t num_rows,
     uint16_t num_columns,
     float outlier_topk_ratio,
     float error_correction_topk_ratio,
     int svd_ranks,
     int svd_niters,
+    quantization_method_t svd_uv_format,
+    quantization_method_t svd_s_format,
+    quantization_method_t quantization_only_format,
+    bitsqz_llm_input_location_t input_location) {
+    if (num_rows == 0 || num_columns == 0) return 1;
+    if (!ratio_is_valid(outlier_topk_ratio) || !ratio_is_valid(error_correction_topk_ratio)) return 1;
+    if (!quant_method_is_valid(svd_uv_format) ||
+        !quant_method_is_valid(svd_s_format) ||
+        !quant_method_is_valid(quantization_only_format)) {
+        return 1;
+    }
+    if (!input_location_is_valid(input_location)) return 1;
+    if (svd_niters < 1) return 1;
+
+    bitsqz_llm_compress_release();
+
+    g_bitsqz_compress_runtime.num_rows = num_rows;
+    g_bitsqz_compress_runtime.num_columns = num_columns;
+    g_bitsqz_compress_runtime.outlier_topk_ratio = outlier_topk_ratio;
+    g_bitsqz_compress_runtime.error_correction_topk_ratio = error_correction_topk_ratio;
+    g_bitsqz_compress_runtime.svd_ranks = svd_ranks;
+    g_bitsqz_compress_runtime.svd_niters = svd_niters;
+    g_bitsqz_compress_runtime.svd_allocated_rank = 0;
+    g_bitsqz_compress_runtime.svd_uv_format = svd_uv_format;
+    g_bitsqz_compress_runtime.svd_s_format = svd_s_format;
+    g_bitsqz_compress_runtime.quantization_only_format = quantization_only_format;
+    g_bitsqz_compress_runtime.input_location = input_location;
+
+    const bool has_svd = (svd_ranks >= 1);
+    const int rank_limit = std::min<int>(num_rows, num_columns);
+    const int q = has_svd ? std::max(1, std::min(svd_ranks, rank_limit)) : 0;
+    const bool use_quantization = config_uses_quantization(g_bitsqz_compress_runtime);
+    const std::size_t matrix_count = static_cast<std::size_t>(num_rows) * num_columns;
+
+    try {
+        allocate_bitsqz_device_buffers(
+            &g_bitsqz_compress_runtime.device_buffers,
+            num_rows,
+            num_columns,
+            q,
+            input_location == BITSQZ_LLM_INPUT_HOST,
+            true,
+            has_svd,
+            use_quantization);
+
+        if (use_quantization) {
+            quantization_cuda_initialize(
+                &g_bitsqz_compress_runtime.quantization_ctx,
+                matrix_count,
+                1234ULL);
+            g_bitsqz_compress_runtime.quantization_initialized = true;
+        }
+
+        if (has_svd) {
+            svd_lowrank_cuda_initialize(
+                static_cast<int>(num_rows),
+                static_cast<int>(num_columns),
+                q,
+                svd_niters,
+                1234ULL);
+            g_bitsqz_compress_runtime.svd_initialized = true;
+
+            reconstruct_lowrank_cuda_initialize(
+                &g_bitsqz_compress_runtime.reconstruct_ctx,
+                static_cast<int>(num_rows),
+                static_cast<int>(num_columns),
+                q,
+                1234ULL);
+            g_bitsqz_compress_runtime.reconstruct_initialized = true;
+            g_bitsqz_compress_runtime.svd_allocated_rank = q;
+        }
+
+        if (outlier_topk_ratio > 0.0f) {
+            initialize_topk_runtime(
+                &g_bitsqz_compress_runtime.outlier_topk,
+                num_rows,
+                num_columns,
+                outlier_topk_ratio);
+        }
+        if (error_correction_topk_ratio > 0.0f) {
+            initialize_topk_runtime(
+                &g_bitsqz_compress_runtime.error_topk,
+                num_rows,
+                num_columns,
+                error_correction_topk_ratio);
+        }
+    } catch (const std::exception &) {
+        bitsqz_llm_compress_release();
+        return 1;
+    }
+
+    g_bitsqz_compress_runtime.initialized = true;
+    return 0;
+}
+
+void bitsqz_llm_compress_release() {
+    release_runtime(&g_bitsqz_compress_runtime);
+}
+
+int bitsqz_llm_decompress_initialize(
+    uint16_t num_rows,
+    uint16_t num_columns,
+    float outlier_topk_ratio,
+    float error_correction_topk_ratio,
+    int svd_ranks,
     quantization_method_t svd_uv_format,
     quantization_method_t svd_s_format,
     quantization_method_t quantization_only_format) {
@@ -760,108 +904,86 @@ int bitsqz_llm_initialize(
         !quant_method_is_valid(quantization_only_format)) {
         return 1;
     }
-    if (svd_niters < 1) return 1;
+    bitsqz_llm_decompress_release();
 
-    bitsqz_llm_release();
-
-    g_bitsqz_runtime.num_rows = num_rows;
-    g_bitsqz_runtime.num_columns = num_columns;
-    g_bitsqz_runtime.outlier_topk_ratio = outlier_topk_ratio;
-    g_bitsqz_runtime.error_correction_topk_ratio = error_correction_topk_ratio;
-    g_bitsqz_runtime.svd_ranks = svd_ranks;
-    g_bitsqz_runtime.svd_niters = svd_niters;
-    g_bitsqz_runtime.svd_rank_capacity = 0;
-    g_bitsqz_runtime.svd_uv_format = svd_uv_format;
-    g_bitsqz_runtime.svd_s_format = svd_s_format;
-    g_bitsqz_runtime.quantization_only_format = quantization_only_format;
+    g_bitsqz_decompress_runtime.num_rows = num_rows;
+    g_bitsqz_decompress_runtime.num_columns = num_columns;
+    g_bitsqz_decompress_runtime.outlier_topk_ratio = outlier_topk_ratio;
+    g_bitsqz_decompress_runtime.error_correction_topk_ratio = error_correction_topk_ratio;
+    g_bitsqz_decompress_runtime.svd_ranks = svd_ranks;
+    g_bitsqz_decompress_runtime.svd_niters = 1;
+    g_bitsqz_decompress_runtime.svd_allocated_rank = 0;
+    g_bitsqz_decompress_runtime.svd_uv_format = svd_uv_format;
+    g_bitsqz_decompress_runtime.svd_s_format = svd_s_format;
+    g_bitsqz_decompress_runtime.quantization_only_format = quantization_only_format;
 
     const bool has_svd = (svd_ranks >= 1);
-    const int rank_limit = std::min<int>(num_rows, num_columns);
-    const int q = has_svd ? std::max(1, std::min(svd_ranks, rank_limit)) : 0;
-    const bool use_quantization = config_uses_quantization(g_bitsqz_runtime);
+    const bool use_quantization = config_uses_quantization(g_bitsqz_decompress_runtime);
     const std::size_t matrix_count = static_cast<std::size_t>(num_rows) * num_columns;
 
     try {
         allocate_bitsqz_device_buffers(
-            &g_bitsqz_runtime.device_buffers,
+            &g_bitsqz_decompress_runtime.device_buffers,
             num_rows,
             num_columns,
-            q,
+            svd_ranks,
+            false,
+            false,
             has_svd,
             use_quantization);
 
         if (use_quantization) {
             quantization_cuda_initialize(
-                &g_bitsqz_runtime.quantization_ctx,
+                &g_bitsqz_decompress_runtime.quantization_ctx,
                 matrix_count,
                 1234ULL);
-            g_bitsqz_runtime.quantization_initialized = true;
+            g_bitsqz_decompress_runtime.quantization_initialized = true;
         }
 
         if (has_svd) {
-            svd_lowrank_cuda_initialize(
-                static_cast<int>(num_rows),
-                static_cast<int>(num_columns),
-                q,
-                svd_niters,
-                1234ULL);
-            g_bitsqz_runtime.svd_initialized = true;
-
             reconstruct_lowrank_cuda_initialize(
-                &g_bitsqz_runtime.reconstruct_ctx,
+                &g_bitsqz_decompress_runtime.reconstruct_ctx,
                 static_cast<int>(num_rows),
                 static_cast<int>(num_columns),
-                q,
+                svd_ranks,
                 1234ULL);
-            g_bitsqz_runtime.reconstruct_initialized = true;
-            g_bitsqz_runtime.svd_rank_capacity = q;
+            g_bitsqz_decompress_runtime.reconstruct_initialized = true;
+            g_bitsqz_decompress_runtime.svd_allocated_rank = svd_ranks;
         }
 
         if (outlier_topk_ratio > 0.0f) {
             initialize_topk_runtime(
-                &g_bitsqz_runtime.outlier_topk,
+                &g_bitsqz_decompress_runtime.outlier_topk,
                 num_rows,
                 num_columns,
                 outlier_topk_ratio);
         }
         if (error_correction_topk_ratio > 0.0f) {
             initialize_topk_runtime(
-                &g_bitsqz_runtime.error_topk,
+                &g_bitsqz_decompress_runtime.error_topk,
                 num_rows,
                 num_columns,
                 error_correction_topk_ratio);
         }
     } catch (const std::exception &) {
-        bitsqz_llm_release();
+        bitsqz_llm_decompress_release();
         return 1;
     }
 
-    g_bitsqz_runtime.initialized = true;
+    g_bitsqz_decompress_runtime.initialized = true;
     return 0;
 }
 
-void bitsqz_llm_release() {
-    g_bitsqz_runtime.outlier_topk.release();
-    g_bitsqz_runtime.error_topk.release();
-    g_bitsqz_runtime.device_buffers.free_all();
-    if (g_bitsqz_runtime.quantization_initialized) {
-        quantization_cuda_release(&g_bitsqz_runtime.quantization_ctx);
-    }
-    if (g_bitsqz_runtime.svd_initialized) {
-        svd_lowrank_cuda_release();
-    }
-    if (g_bitsqz_runtime.reconstruct_initialized) {
-        reconstruct_lowrank_cuda_release(&g_bitsqz_runtime.reconstruct_ctx);
-    }
-    g_bitsqz_runtime = BitsqzRuntimeConfig{};
+void bitsqz_llm_decompress_release() {
+    release_runtime(&g_bitsqz_decompress_runtime);
 }
 
 int bitsqz_llm_compress(
-    const float *d_row_major_matrix_float_data,
+    const float *row_major_matrix_float_data,
     bitsqz_llm_array_t **out,
     bitsqz_llm_compress_profile_t *profile) {
-    if (!g_bitsqz_runtime.initialized) return 1;
-    if (!d_row_major_matrix_float_data || !out || *out) return 1;
+    if (!g_bitsqz_compress_runtime.initialized) return 1;
+    if (!row_major_matrix_float_data || !out || *out) return 1;
 
     if (profile) {
         *profile = bitsqz_llm_compress_profile_t{};
@@ -880,7 +1002,7 @@ int bitsqz_llm_compress(
     double reconstruct_svd_latency_ms = 0.0;
     double error_extraction_latency_ms = 0.0;
 
-    BitsqzRuntimeConfig &cfg = g_bitsqz_runtime;
+    BitsqzRuntimeConfig &cfg = g_bitsqz_compress_runtime;
     const uint16_t num_rows = cfg.num_rows;
     const uint16_t num_columns = cfg.num_columns;
     const uint32_t num_elements = static_cast<uint32_t>(num_rows) * num_columns;
@@ -896,13 +1018,29 @@ int bitsqz_llm_compress(
     uint16_t effective_rank = 0;
 
     try {
+        const float *d_input = row_major_matrix_float_data;
+        if (cfg.input_location == BITSQZ_LLM_INPUT_HOST) {
+            if (cfg.device_buffers.d_input_stage == nullptr) {
+                return 1;
+            }
+            check_cuda(
+                cudaMemcpyAsync(
+                    cfg.device_buffers.d_input_stage,
+                    row_major_matrix_float_data,
+                    matrix_bytes,
+                    cudaMemcpyHostToDevice),
+                "cudaMemcpyAsync input H2D failed");
+            d_input = cfg.device_buffers.d_input_stage;
+        }
+
         check_cuda(
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 cfg.device_buffers.d_residual,
-                d_row_major_matrix_float_data,
+                d_input,
                 matrix_bytes,
                 cudaMemcpyDeviceToDevice),
-            "cudaMemcpy input D2D failed");
+            "cudaMemcpyAsync input D2D failed");
+        check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after input staging failed");
 
         if (cfg.outlier_topk.initialized) {
             cfg.outlier_topk.reset_array(num_rows, num_columns);
@@ -925,7 +1063,7 @@ int bitsqz_llm_compress(
             flags |= BITSQZ_FLAG_HAS_SVD;
             const int rank_limit = std::min<int>(num_rows, num_columns);
             const int expected_q = std::max(1, std::min(cfg.svd_ranks, rank_limit));
-            if (cfg.svd_rank_capacity != expected_q) return 1;
+            if (cfg.svd_allocated_rank != expected_q) return 1;
 
             const auto step_begin = Clock::now();
             svd_lowrank_cuda(
@@ -937,7 +1075,7 @@ int bitsqz_llm_compress(
             svd_lowrank_cuda_latency_ms += elapsed_ms(step_begin, Clock::now());
             effective_rank = static_cast<uint16_t>(expected_q);
 
-            if (cfg.svd_uv_format != quantization_INVALID) {
+            if (cfg.svd_uv_format != quantization_NONE) {
                 if (append_quantized_section(
                         &cfg,
                         cfg.device_buffers.d_u,
@@ -958,7 +1096,7 @@ int bitsqz_llm_compress(
                 return 1;
             }
 
-            if (cfg.svd_s_format != quantization_INVALID) {
+            if (cfg.svd_s_format != quantization_NONE) {
                 if (append_quantized_section(
                         &cfg,
                         cfg.device_buffers.d_s,
@@ -979,7 +1117,7 @@ int bitsqz_llm_compress(
                 return 1;
             }
 
-            if (cfg.svd_uv_format != quantization_INVALID) {
+            if (cfg.svd_uv_format != quantization_NONE) {
                 if (append_quantized_section(
                         &cfg,
                         cfg.device_buffers.d_v,
@@ -1042,7 +1180,7 @@ int bitsqz_llm_compress(
             }
         } else {
             effective_rank = 0;
-            if (cfg.quantization_only_format != quantization_INVALID) {
+            if (cfg.quantization_only_format != quantization_NONE) {
                 if (append_quantized_section(
                         &cfg,
                         cfg.device_buffers.d_residual,
@@ -1164,11 +1302,11 @@ int bitsqz_llm_compress(
 }
 
 int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *d_dst, uint32_t dst_num_elements) {
-    if (!g_bitsqz_runtime.initialized) return 1;
+    if (!g_bitsqz_decompress_runtime.initialized) return 1;
     if (!compressed || !d_dst || !compressed->payload) return 1;
     if (dst_num_elements < compressed->num_elements) return 1;
 
-    BitsqzRuntimeConfig &cfg = g_bitsqz_runtime;
+    BitsqzRuntimeConfig &cfg = g_bitsqz_decompress_runtime;
     if (validate_decompress_compatibility(&cfg, compressed) != 0) {
         return 1;
     }
@@ -1178,7 +1316,8 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *d_dst, ui
             const uint16_t rank = static_cast<uint16_t>(compressed->effective_rank);
             if (rank == 0) return 1;
             if (!cfg.reconstruct_initialized) return 1;
-            if (cfg.svd_rank_capacity != static_cast<int>(rank)) {
+            if (cfg.svd_ranks != static_cast<int>(rank) ||
+                cfg.svd_allocated_rank != static_cast<int>(rank)) {
                 return 1;
             }
 
@@ -1209,6 +1348,8 @@ int bitsqz_llm_decompress(const bitsqz_llm_array_t *compressed, float *d_dst, ui
                     cfg.device_buffers.d_v) != 0) {
                 return 1;
             }
+
+            check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before SVD reconstruct failed");
 
             reconstruct_lowrank_cuda(
                 &cfg.reconstruct_ctx,
